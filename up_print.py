@@ -3,6 +3,7 @@ import argparse
 import os
 import sys
 import time
+import mimetypes
 from typing import Dict, Optional, Tuple
 
 import msal
@@ -49,12 +50,14 @@ def create_print_job(token: str, printer_id: str, job_name: str) -> Dict:
     return resp.json()
 
 
-def create_document_and_upload_session(token: str, printer_id: str, job_id: str, file_path: str) -> Tuple[str, str]:
+def create_document_and_upload_session(token: str, printer_id: str, job_id: str, file_path: str, content_type: Optional[str]) -> Tuple[str, str]:
     file_name = os.path.basename(file_path)
+    guessed_type, _ = mimetypes.guess_type(file_path)
+    effective_content_type = content_type or guessed_type or "application/octet-stream"
 
     # 1) Create document on the job
     doc_url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs/{job_id}/documents"
-    doc_payload = {"displayName": file_name}
+    doc_payload = {"displayName": file_name, "contentType": effective_content_type}
     doc_resp = requests.post(doc_url, headers=graph_headers(token), json=doc_payload, timeout=60)
     if doc_resp.status_code not in (200, 201):
         raise RuntimeError(f"Create document failed: {doc_resp.status_code} {doc_resp.text}")
@@ -89,6 +92,7 @@ def upload_file_to_upload_session(upload_url: str, file_path: str, chunk_size: i
             headers = {
                 "Content-Length": str(len(chunk)),
                 "Content-Range": f"bytes {start}-{end}/{total_size}",
+                "Content-Type": "application/octet-stream",
             }
             put_resp = requests.put(upload_url, headers=headers, data=chunk, timeout=300)
             if put_resp.status_code not in (200, 201, 202):
@@ -101,7 +105,7 @@ def upload_file_to_upload_session(upload_url: str, file_path: str, chunk_size: i
 def start_print_job(token: str, printer_id: str, job_id: str) -> None:
     url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs/{job_id}/start"
     resp = requests.post(url, headers=graph_headers(token), json={}, timeout=60)
-    if resp.status_code not in (200, 202):
+    if resp.status_code not in (200, 202, 204):
         raise RuntimeError(f"Start job failed: {resp.status_code} {resp.text}")
 
 
@@ -114,16 +118,10 @@ def get_job(token: str, printer_id: str, job_id: str) -> Dict:
 
 
 def extract_job_state(job: Dict) -> Tuple[str, Optional[str]]:
-    # Try to be resilient to possible shapes of the job status payload
-    state = None
-    description = None
-    status = job.get("status")
-    if isinstance(status, dict):
-        state = status.get("state") or status.get("processingState")
-        description = status.get("description")
-    if not state:
-        state = job.get("processingState") or job.get("state")
-    return (state or "unknown", description)
+    status = job.get("status") or {}
+    state = status.get("state") or "unknown"
+    description = status.get("description")
+    return (state, description)
 
 
 def poll_until_completed(token: str, printer_id: str, job_id: str, interval_seconds: int = 5, timeout_seconds: int = 600) -> None:
@@ -146,6 +144,7 @@ def main() -> int:
     parser.add_argument("--file", dest="file_path", default=os.getenv("FILE_PATH"), help="Path to file to print (PDF, XPS, etc.)")
     parser.add_argument("--job-name", default="UP Job", help="Display name for the print job")
     parser.add_argument("--poll", action="store_true", help="Poll job status until completion")
+    parser.add_argument("--content-type", dest="content_type", default=None, help="Override document contentType (e.g., application/pdf)")
     parser.add_argument("--tenant-id", default=os.getenv("TENANT_ID"), help="Azure AD tenant ID")
     parser.add_argument("--client-id", default=os.getenv("CLIENT_ID"), help="App registration client ID")
     parser.add_argument("--client-secret", default=os.getenv("CLIENT_SECRET"), help="App registration client secret")
@@ -174,7 +173,7 @@ def main() -> int:
             raise RuntimeError("Job ID missing in create job response")
         print(f"Created job {job_id}")
 
-        _, upload_url = create_document_and_upload_session(token, args.printer_id, job_id, args.file_path)
+        _, upload_url = create_document_and_upload_session(token, args.printer_id, job_id, args.file_path, args.content_type)
         print("Uploading document...")
         upload_file_to_upload_session(upload_url, args.file_path)
         print("Upload complete.")

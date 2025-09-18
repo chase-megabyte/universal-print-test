@@ -38,6 +38,7 @@ You can pass args or rely on `.env` values.
 python up_print.py \
   --printer-id "<printer-guid>" \
   --file "/absolute/path/to/document.pdf" \
+  --content-type "application/pdf" \
   --job-name "My Graph UP Job" \
   --poll
 ```
@@ -52,8 +53,8 @@ python up_print.py --poll
 
 1. Obtains an app-only token using MSAL (`client_credentials`) for the `https://graph.microsoft.com/.default` scope.
 2. Creates a print job under `/print/printers/{printerId}/jobs`.
-3. Creates a document and an upload session, then uploads the file in chunks with `Content-Range` headers.
-4. Starts the job and optionally polls `/print/printers/{printerId}/jobs/{jobId}` until a terminal state.
+3. Creates a document (setting `contentType`) and an upload session, then uploads the file in chunks with `Content-Range` headers.
+4. Starts the job and optionally polls `/print/printers/{printerId}/jobs/{jobId}` reading `printJob.status.state` until a terminal state.
 
 ### Notes
 
