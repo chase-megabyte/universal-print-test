@@ -9,6 +9,7 @@ This small CLI creates a Universal Print job for a given printer, uploads a docu
 - Application permissions granted (admin consent):
   - Printer.Read.All
   - PrintJob.ReadWrite.All
+  - PrintJob.Manage.All
   - Files.ReadWrite.All is NOT needed for Universal Print upload sessions
 - A target Universal Print `printerId` and a printable file (PDF/XPS are recommended)
 
@@ -37,6 +38,7 @@ You can pass args or rely on `.env` values.
 ```bash
 python up_print.py \
   --printer-id "<printer-guid>" \
+  --share-id "<printer-share-guid>" \  # optional; will auto-resolve if omitted
   --file "/absolute/path/to/document.pdf" \
   --content-type "application/pdf" \
   --job-name "My Graph UP Job" \
@@ -53,15 +55,16 @@ python up_print.py --poll
 #### Debugging 403 errors
 
 - Use `--debug` to print token claims (audience, tenant, roles) and validate the printer with a preflight GET.
-- Required Graph Application permissions (admin consent): `Printer.Read.All`, `PrintJob.ReadWrite.All`.
+- Required Graph Application permissions (admin consent): `Printer.Read.All`, `PrintJob.ReadWrite.All`, `PrintJob.Manage.All`.
 - After granting consent, wait a couple minutes and retry.
+- If using app-only, create jobs on a printer share: the script now resolves the first share for the printer (or use `--share-id`). Ensure the app's service principal has access to that share (via a group or direct assignment) in the Universal Print portal.
 
 ### What the script does
 
 1. Obtains an app-only token using MSAL (`client_credentials`) for the `https://graph.microsoft.com/.default` scope.
-2. Creates a print job under `/print/printers/{printerId}/jobs`.
+2. Resolves/validates a printer share and creates a print job under `/print/shares/{shareId}/jobs`.
 3. Creates a document (setting `contentType`) and an upload session, then uploads the file in chunks with `Content-Range` headers.
-4. Starts the job and optionally polls `/print/printers/{printerId}/jobs/{jobId}` reading `printJob.status.state` until a terminal state.
+4. Starts the job and optionally polls `/print/shares/{shareId}/jobs/{jobId}` reading `printJob.status.state` until a terminal state.
 
 ### Notes
 
