@@ -239,42 +239,12 @@ def detect_content_type(file_path: str, explicit_content_type: Optional[str], de
     return "application/octet-stream", "fallback"
 
 
-def _validate_share_exists(token: str, share_id: str, debug: bool = False) -> Tuple[str, Optional[str]]:
-    url = f"{GRAPH_BASE_URL}/print/shares/{share_id}?$select=id,displayName"
-    resp = requests.get(url, headers=graph_headers(token), timeout=30)
-    if resp.status_code == 404:
-        raise RuntimeError(_build_graph_error_message("Validate printer share (not found)", resp))
-    if resp.status_code == 403:
-        raise RuntimeError(_build_graph_error_message("Validate printer share (forbidden)", resp))
-    if resp.status_code != 200:
-        raise RuntimeError(_build_graph_error_message("Validate printer share", resp))
-    data = resp.json()
-    if debug:
-        print(f"[debug] share ok: {data.get('id')} {data.get('displayName')}", file=sys.stderr)
-    return data.get("id"), data.get("displayName")
+def _noop() -> None:
+    return None
 
 
-def _resolve_share_for_printer(token: str, printer_id: str, debug: bool = False) -> Tuple[str, Optional[str]]:
-    url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/shares?$select=id,displayName&$top=1"
-    resp = requests.get(url, headers=graph_headers(token), timeout=30)
-    if resp.status_code == 404:
-        raise RuntimeError(_build_graph_error_message("Resolve printer share (printer or shares not found)", resp))
-    if resp.status_code == 403:
-        raise RuntimeError(_build_graph_error_message("Resolve printer share (forbidden)", resp))
-    if resp.status_code != 200:
-        raise RuntimeError(_build_graph_error_message("Resolve printer share", resp))
-    data = resp.json() or {}
-    values = data.get("value") or []
-    if not values:
-        raise RuntimeError("Printer has no shares. Share the printer in Universal Print and grant the app access.")
-    share = values[0]
-    if debug:
-        print(f"[debug] resolved share: {share.get('id')} {share.get('displayName')}", file=sys.stderr)
-    return share.get("id"), share.get("displayName")
-
-
-def create_print_job(token: str, share_id: str, job_name: str, job_configuration: Optional[Dict[str, Any]] = None) -> Dict:
-    url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs"
+def create_print_job(token: str, printer_id: str, job_name: str, job_configuration: Optional[Dict[str, Any]] = None) -> Dict:
+    url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs"
     payload: Dict[str, Any] = {"displayName": job_name}
     if job_configuration:
         payload["configuration"] = job_configuration
@@ -286,13 +256,11 @@ def create_print_job(token: str, share_id: str, job_name: str, job_configuration
 
 def create_document_and_upload_session(
     token: str,
-    share_id: str,
+    printer_id: str,
     job_id: str,
     file_path: str,
     content_type: Optional[str],
     debug: bool = False,
-    printer_id: Optional[str] = None,
-    try_printer_path_on_404: bool = False,
 ) -> Tuple[str, str]:
     file_name = os.path.basename(file_path)
     effective_content_type, ctype_source = detect_content_type(file_path, content_type, debug=debug)
@@ -305,28 +273,23 @@ def create_document_and_upload_session(
     # Optional: verify the job exists (helps diagnose bad IDs or scope mismatches)
     if debug:
         try:
-            share_job_url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs/{job_id}?$select=id,createdDateTime"
-            share_job_resp = requests.get(share_job_url, headers=graph_headers(token), timeout=30)
-            if share_job_resp.status_code == 200:
-                job_meta = share_job_resp.json() or {}
+            printer_job_url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs/{job_id}?$select=id,createdDateTime"
+            printer_job_resp = requests.get(printer_job_url, headers=graph_headers(token), timeout=30)
+            if printer_job_resp.status_code == 200:
+                job_meta = printer_job_resp.json() or {}
                 print(f"[debug] job ok: {job_meta.get('id')}", file=sys.stderr)
             else:
-                print(f"[debug] share job lookup failed: {_build_graph_error_message('Get share job', share_job_resp)}", file=sys.stderr)
-            if printer_id:
-                printer_job_url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs/{job_id}?$select=id,createdDateTime"
-                printer_job_resp = requests.get(printer_job_url, headers=graph_headers(token), timeout=30)
-                if printer_job_resp.status_code == 200:
-                    job_meta = printer_job_resp.json() or {}
-                    print(f"[debug] printer-path job exists too: {job_meta.get('id')}", file=sys.stderr)
-                else:
-                    # This helps confirm the correct base segment to use
-                    print(f"[debug] printer job lookup: {_build_graph_error_message('Get printer job', printer_job_resp)}", file=sys.stderr)
+                print(f"[debug] printer job lookup: {_build_graph_error_message('Get printer job', printer_job_resp)}", file=sys.stderr)
         except Exception:  # noqa: BLE001
             pass
 
     # Preferred: create an upload session on the documents collection (no pre-created document)
-    collection_session_url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs/{job_id}/documents/createUploadSession"
-    collection_payload = {"documentName": file_name, "contentType": effective_content_type}
+    collection_session_url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs/{job_id}/documents/createUploadSession"
+    collection_payload = {
+        "documentName": file_name,
+        "contentType": effective_content_type,
+        "size": os.path.getsize(file_path),
+    }
     try:
         if debug:
             try:
@@ -358,7 +321,7 @@ def create_document_and_upload_session(
         pass
 
     # Fallback: create document, then create an upload session on that document
-    doc_url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs/{job_id}/documents"
+    doc_url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs/{job_id}/documents"
     doc_payload = {"displayName": file_name, "contentType": effective_content_type}
     if debug:
         try:
@@ -367,43 +330,13 @@ def create_document_and_upload_session(
             pass
     doc_resp = requests.post(doc_url, headers=graph_headers(token), json=doc_payload, timeout=60)
     if doc_resp.status_code not in (200, 201):
-        # Optional printer-path fallback if explicitly requested
-        if try_printer_path_on_404 and doc_resp.status_code == 404 and printer_id:
-            printer_doc_url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs/{job_id}/documents"
-            if debug:
-                try:
-                    print(f"[debug] share path Create document returned 404; trying printer path: {printer_doc_url}", file=sys.stderr)
-                except Exception:  # noqa: BLE001
-                    pass
-            printer_doc_resp = requests.post(printer_doc_url, headers=graph_headers(token), json=doc_payload, timeout=60)
-            if printer_doc_resp.status_code in (200, 201):
-                document = printer_doc_resp.json() or {}
-                document_id = document.get("id")
-                if not document_id:
-                    raise RuntimeError("Document ID missing in create document response (printer path)")
-                session_url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs/{job_id}/documents/{document_id}/createUploadSession"
-                if debug:
-                    try:
-                        print(f"[debug] POST {session_url} body={{}}", file=sys.stderr)
-                    except Exception:  # noqa: BLE001
-                        pass
-                session_resp = requests.post(session_url, headers=graph_headers(token), json={}, timeout=60)
-                if session_resp.status_code not in (200, 201):
-                    raise RuntimeError(_build_graph_error_message("Create upload session (printer path)", session_resp))
-                upload_session = session_resp.json() or {}
-                upload_url = upload_session.get("uploadUrl")
-                if not upload_url:
-                    raise RuntimeError("uploadUrl missing in upload session response (printer path)")
-                return document_id, upload_url
-            else:
-                raise RuntimeError(_build_graph_error_message("Create document (printer path)", printer_doc_resp))
         raise RuntimeError(_build_graph_error_message("Create document", doc_resp))
     document = doc_resp.json() or {}
     document_id = document.get("id")
     if not document_id:
         raise RuntimeError("Document ID missing in create document response")
 
-    session_url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs/{job_id}/documents/{document_id}/createUploadSession"
+    session_url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs/{job_id}/documents/{document_id}/createUploadSession"
     if debug:
         try:
             print(f"[debug] POST {session_url} body={{}}", file=sys.stderr)
@@ -443,15 +376,15 @@ def upload_file_to_upload_session(upload_url: str, file_path: str, chunk_size: i
             bytes_uploaded = end + 1
 
 
-def start_print_job(token: str, share_id: str, job_id: str) -> None:
-    url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs/{job_id}/start"
+def start_print_job(token: str, printer_id: str, job_id: str) -> None:
+    url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs/{job_id}/start"
     resp = requests.post(url, headers=graph_headers(token), json={}, timeout=60)
     if resp.status_code not in (200, 202, 204):
         raise RuntimeError(_build_graph_error_message("Start job", resp))
 
 
-def get_job(token: str, share_id: str, job_id: str) -> Dict:
-    url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs/{job_id}"
+def get_job(token: str, printer_id: str, job_id: str) -> Dict:
+    url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs/{job_id}"
     resp = requests.get(url, headers=graph_headers(token), timeout=60)
     if resp.status_code != 200:
         raise RuntimeError(_build_graph_error_message("Get job", resp))
@@ -465,10 +398,10 @@ def extract_job_state(job: Dict) -> Tuple[str, Optional[str]]:
     return (state, description)
 
 
-def poll_until_completed(token: str, share_id: str, job_id: str, interval_seconds: int = 5, timeout_seconds: int = 600) -> None:
+def poll_until_completed(token: str, printer_id: str, job_id: str, interval_seconds: int = 5, timeout_seconds: int = 600) -> None:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
-        job = get_job(token, share_id, job_id)
+        job = get_job(token, printer_id, job_id)
         state, description = extract_job_state(job)
         print(f"Job {job_id} state: {state}{' - ' + description if description else ''}")
         if state in {"completed", "aborted", "canceled", "failed"}:
@@ -536,14 +469,14 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(description="Create and start a Universal Print job via Microsoft Graph")
     parser.add_argument("--printer-id", default=os.getenv("PRINTER_ID"), help="Printer ID in Universal Print")
-    parser.add_argument("--share-id", default=os.getenv("SHARE_ID"), help="Printer share ID (optional; if not provided, resolves first share of the printer)")
+    # Share functionality removed; use printer-id endpoints only
     parser.add_argument("--file", dest="file_path", default=os.getenv("FILE_PATH"), help="Path to file to print (PDF, XPS, etc.)")
     parser.add_argument("--job-name", default="UP Job", help="Display name for the print job")
     parser.add_argument("--poll", action="store_true", help="Poll job status until completion")
     parser.add_argument("--content-type", dest="content_type", default=None, help="Override document contentType (e.g., application/pdf)")
     parser.add_argument("--debug", action="store_true", help="Print token claims and verbose diagnostics")
     parser.add_argument("--auth", choices=["app", "device"], default=os.getenv("AUTH", "app"), help="Authentication mode: app (client credentials) or device (device code delegated)")
-    parser.add_argument("--scopes", nargs="*", default=os.getenv("SCOPES", "PrinterShare.ReadWrite.All offline_access").split(), help="Delegated scopes for device auth (space-separated)")
+    parser.add_argument("--scopes", nargs="*", default=os.getenv("SCOPES", "Printer.Read.All PrintJob.ReadWrite.All PrintJob.Manage.All offline_access").split(), help="Delegated scopes for device auth (space-separated)")
     parser.add_argument("--cache-path", default=os.getenv("MSAL_CACHE_PATH", os.path.expanduser("~/.msal_up_cli_cache.json")), help="Path to MSAL token cache for device auth")
     parser.add_argument("--tenant-id", default=os.getenv("TENANT_ID"), help="Azure AD tenant ID")
     parser.add_argument("--client-id", default=os.getenv("CLIENT_ID"), help="App registration client ID")
@@ -590,12 +523,6 @@ def main() -> int:
             meta = preflight.json()
             print(f"[debug] printer ok: {meta.get('id')} {meta.get('displayName')}", file=sys.stderr)
 
-        # Resolve/validate share
-        if args.share_id:
-            share_id, _ = _validate_share_exists(token, args.share_id, debug=args.debug)
-        else:
-            share_id, _ = _resolve_share_for_printer(token, args.printer_id, debug=args.debug)
-
         # Build job configuration from printer defaults to avoid 400 Missing configuration
         defaults = _get_printer_defaults(token, args.printer_id, debug=args.debug)
         job_configuration = _build_job_configuration_from_defaults(defaults)
@@ -605,7 +532,7 @@ def main() -> int:
             except Exception:  # noqa: BLE001
                 pass
 
-        job = create_print_job(token, share_id, args.job_name, job_configuration=job_configuration or None)
+        job = create_print_job(token, args.printer_id, args.job_name, job_configuration=job_configuration or None)
         job_id = job.get("id")
         if not job_id:
             raise RuntimeError("Job ID missing in create job response")
@@ -613,24 +540,22 @@ def main() -> int:
 
         _, upload_url = create_document_and_upload_session(
             token,
-            share_id,
+            args.printer_id,
             job_id,
             args.file_path,
             args.content_type,
             debug=args.debug,
-            printer_id=args.printer_id,
-            try_printer_path_on_404=True,
         )
         print("Uploading document...")
         upload_file_to_upload_session(upload_url, args.file_path)
         print("Upload complete.")
 
         print("Starting job...")
-        start_print_job(token, share_id, job_id)
+        start_print_job(token, args.printer_id, job_id)
         print("Job started.")
 
         if args.poll:
-            poll_until_completed(token, share_id, job_id)
+            poll_until_completed(token, args.printer_id, job_id)
             print("Job finished.")
 
         return 0
