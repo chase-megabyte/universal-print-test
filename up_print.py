@@ -196,9 +196,11 @@ def _resolve_share_for_printer(token: str, printer_id: str, debug: bool = False)
     return share.get("id"), share.get("displayName")
 
 
-def create_print_job(token: str, share_id: str, job_name: str) -> Dict:
+def create_print_job(token: str, share_id: str, job_name: str, job_configuration: Optional[Dict[str, Any]] = None) -> Dict:
     url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs"
-    payload = {"displayName": job_name}
+    payload: Dict[str, Any] = {"displayName": job_name}
+    if job_configuration:
+        payload["configuration"] = job_configuration
     resp = requests.post(url, headers=graph_headers(token), json=payload, timeout=60)
     if resp.status_code not in (200, 201):
         raise RuntimeError(_build_graph_error_message("Create job", resp))
@@ -291,6 +293,60 @@ def poll_until_completed(token: str, share_id: str, job_id: str, interval_second
     raise TimeoutError("Timed out waiting for job to complete")
 
 
+def _get_printer_defaults(token: str, printer_id: str, debug: bool = False) -> Dict[str, Any]:
+    """Fetch printer defaults for use in job configuration.
+
+    Tries to read `defaults` from the printer resource. Returns an empty dict
+    on failure so callers can decide how to proceed.
+    """
+    url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}?$select=defaults"
+    resp = requests.get(url, headers=graph_headers(token), timeout=30)
+    if resp.status_code != 200:
+        if debug:
+            print(f"[debug] could not fetch printer defaults: {_build_graph_error_message('Get printer defaults', resp)}", file=sys.stderr)
+        return {}
+    data = resp.json() or {}
+    defaults = data.get("defaults") or {}
+    if debug:
+        try:
+            print(f"[debug] printer defaults: {json.dumps(defaults, separators=(',', ':'), ensure_ascii=False)}", file=sys.stderr)
+        except Exception:  # noqa: BLE001
+            pass
+    return defaults
+
+
+def _build_job_configuration_from_defaults(defaults: Dict[str, Any]) -> Dict[str, Any]:
+    """Translate printer defaults to a print job configuration.
+
+    Only includes properties present in defaults and recognized by the API.
+    """
+    if not isinstance(defaults, dict):
+        return {}
+    allowed_keys = {
+        "copies",
+        "colorMode",
+        "duplexMode",
+        "quality",
+        "dpi",
+        "orientation",
+        "mediaSize",
+        "mediaType",
+        "pagesPerSheet",
+        "margins",
+        "finishings",
+        "fitPdfToPage",
+    }
+    configuration: Dict[str, Any] = {}
+    for key in allowed_keys:
+        value = defaults.get(key)
+        if value is not None:
+            configuration[key] = value
+    # Ensure at least copies is set; some connectors require it
+    if "copies" not in configuration:
+        configuration["copies"] = 1
+    return configuration
+
+
 def main() -> int:
     load_env()
 
@@ -356,7 +412,16 @@ def main() -> int:
         else:
             share_id, _ = _resolve_share_for_printer(token, args.printer_id, debug=args.debug)
 
-        job = create_print_job(token, share_id, args.job_name)
+        # Build job configuration from printer defaults to avoid 400 Missing configuration
+        defaults = _get_printer_defaults(token, args.printer_id, debug=args.debug)
+        job_configuration = _build_job_configuration_from_defaults(defaults)
+        if args.debug and job_configuration:
+            try:
+                print(f"[debug] job configuration: {json.dumps(job_configuration, separators=(',', ':'), ensure_ascii=False)}", file=sys.stderr)
+            except Exception:  # noqa: BLE001
+                pass
+
+        job = create_print_job(token, share_id, args.job_name, job_configuration=job_configuration or None)
         job_id = job.get("id")
         if not job_id:
             raise RuntimeError("Job ID missing in create job response")

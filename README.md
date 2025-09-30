@@ -63,11 +63,16 @@ python up_print.py --poll
 
 1. Obtains an app-only token using MSAL (`client_credentials`) for the `https://graph.microsoft.com/.default` scope.
 2. Resolves/validates a printer share and creates a print job under `/print/shares/{shareId}/jobs`.
-3. Creates a document (setting `contentType`) and an upload session, then uploads the file in chunks with `Content-Range` headers.
-4. Starts the job and optionally polls `/print/shares/{shareId}/jobs/{jobId}` reading `printJob.status.state` until a terminal state.
+3. Fetches the printer's defaults and includes a job `configuration` to avoid 400 "Missing configuration" from some connectors.
+4. Creates a document (setting `contentType`) and an upload session, then uploads the file in chunks with `Content-Range` headers.
+5. Starts the job and optionally polls `/print/shares/{shareId}/jobs/{jobId}` reading `printJob.status.state` until a terminal state.
 
 ### Notes
 
 - Use files that your printer supports (PDF/XPS preferred). Office formats may require conversion.
 - Ensure the service principal of your app has access to the tenant and Universal Print. Some tenants restrict Universal Print to specific groups.
 - The script prints basic status lines; you can extend error handling and logging as needed.
+
+#### About 400 "Missing configuration"
+
+Some Universal Print connectors require specific job configuration to be present when creating a job. The script now fetches `print/printers/{printerId}?$select=defaults` and maps known defaults (e.g., `copies`, `colorMode`, `duplexMode`, `mediaSize`) into the job creation payload. This eliminates the 400 error in most cases. You can inspect what is sent using `--debug`.
