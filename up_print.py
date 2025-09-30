@@ -125,9 +125,11 @@ def _extract_graph_error(resp: requests.Response) -> Dict[str, Any]:
         "message": None,
         "inner_request_id": None,
         "inner_client_request_id": None,
+        "raw_response": None,
     }
     try:
         data = resp.json()
+        details["raw_response"] = data
     except Exception:  # noqa: BLE001
         data = None
     if isinstance(data, dict) and data.get("error"):
@@ -273,13 +275,28 @@ def create_document_and_upload_session(
     # Optional: verify the job exists (helps diagnose bad IDs or scope mismatches)
     if debug:
         try:
-            printer_job_url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs/{job_id}?$select=id,createdDateTime"
+            printer_job_url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs/{job_id}?$select=id,createdDateTime,status"
             printer_job_resp = requests.get(printer_job_url, headers=graph_headers(token), timeout=30)
             if printer_job_resp.status_code == 200:
                 job_meta = printer_job_resp.json() or {}
                 print(f"[debug] job ok: {job_meta.get('id')}", file=sys.stderr)
+                job_status = job_meta.get("status") or {}
+                if job_status:
+                    print(f"[debug] job status: {json.dumps(job_status, separators=(',', ':'), ensure_ascii=False)}", file=sys.stderr)
             else:
                 print(f"[debug] printer job lookup: {_build_graph_error_message('Get printer job', printer_job_resp)}", file=sys.stderr)
+        except Exception:  # noqa: BLE001
+            pass
+        
+        # Also try to access via the global print/jobs endpoint
+        try:
+            global_job_url = f"{GRAPH_BASE_URL}/print/jobs/{job_id}?$select=id,createdDateTime,status"
+            global_job_resp = requests.get(global_job_url, headers=graph_headers(token), timeout=30)
+            if global_job_resp.status_code == 200:
+                global_job_meta = global_job_resp.json() or {}
+                print(f"[debug] global job lookup ok: {global_job_meta.get('id')}", file=sys.stderr)
+            else:
+                print(f"[debug] global job lookup failed: {_build_graph_error_message('Get global job', global_job_resp)}", file=sys.stderr)
         except Exception:  # noqa: BLE001
             pass
 
@@ -312,7 +329,10 @@ def create_document_and_upload_session(
         # If not supported (older tenant/connector), fall back to legacy two-step flow
         if debug:
             try:
+                err_details = _extract_graph_error(session_resp)
                 print(f"[debug] collection createUploadSession failed: {_build_graph_error_message('Create upload session (collection)', session_resp)}", file=sys.stderr)
+                if err_details.get("raw_response"):
+                    print(f"[debug] response body: {json.dumps(err_details['raw_response'], separators=(',', ':'), ensure_ascii=False)}", file=sys.stderr)
                 print(f"[debug] falling back to create document flow", file=sys.stderr)
             except Exception:  # noqa: BLE001
                 pass
@@ -330,7 +350,28 @@ def create_document_and_upload_session(
             pass
     doc_resp = requests.post(doc_url, headers=graph_headers(token), json=doc_payload, timeout=60)
     if doc_resp.status_code not in (200, 201):
-        raise RuntimeError(_build_graph_error_message("Create document", doc_resp))
+        err_msg = _build_graph_error_message("Create document", doc_resp)
+        if debug:
+            try:
+                err_details = _extract_graph_error(doc_resp)
+                if err_details.get("raw_response"):
+                    print(f"[debug] create document response body: {json.dumps(err_details['raw_response'], separators=(',', ':'), ensure_ascii=False)}", file=sys.stderr)
+                
+                # Try alternative endpoint via /print/jobs
+                print(f"[debug] attempting alternative endpoint via /print/jobs/{job_id}/documents", file=sys.stderr)
+                alt_doc_url = f"{GRAPH_BASE_URL}/print/jobs/{job_id}/documents"
+                alt_doc_resp = requests.post(alt_doc_url, headers=graph_headers(token), json=doc_payload, timeout=60)
+                if alt_doc_resp.status_code in (200, 201):
+                    print(f"[debug] alternative endpoint succeeded!", file=sys.stderr)
+                    doc_resp = alt_doc_resp  # Use the alternative response
+                else:
+                    print(f"[debug] alternative endpoint also failed: {_build_graph_error_message('Create document (alt)', alt_doc_resp)}", file=sys.stderr)
+            except Exception:  # noqa: BLE001
+                pass
+        
+        # Only raise if alternative didn't work
+        if doc_resp.status_code not in (200, 201):
+            raise RuntimeError(err_msg)
     document = doc_resp.json() or {}
     document_id = document.get("id")
     if not document_id:
@@ -432,6 +473,31 @@ def _get_printer_defaults(token: str, printer_id: str, debug: bool = False) -> D
     return defaults
 
 
+def _get_printer_capabilities(token: str, printer_id: str, debug: bool = False) -> Dict[str, Any]:
+    """Fetch printer capabilities to check supported content types.
+
+    Returns an empty dict on failure so callers can decide how to proceed.
+    """
+    url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}?$select=capabilities"
+    resp = requests.get(url, headers=graph_headers(token), timeout=30)
+    if resp.status_code != 200:
+        if debug:
+            print(f"[debug] could not fetch printer capabilities: {_build_graph_error_message('Get printer capabilities', resp)}", file=sys.stderr)
+        return {}
+    data = resp.json() or {}
+    capabilities = data.get("capabilities") or {}
+    if debug:
+        try:
+            content_types = capabilities.get("contentTypes") or []
+            if content_types:
+                print(f"[debug] printer supported content types: {json.dumps(content_types, separators=(',', ':'), ensure_ascii=False)}", file=sys.stderr)
+            else:
+                print(f"[debug] printer capabilities: {json.dumps(capabilities, separators=(',', ':'), ensure_ascii=False)}", file=sys.stderr)
+        except Exception:  # noqa: BLE001
+            pass
+    return capabilities
+
+
 def _build_job_configuration_from_defaults(defaults: Dict[str, Any]) -> Dict[str, Any]:
     """Translate printer defaults to a print job configuration.
 
@@ -522,6 +588,16 @@ def main() -> int:
         if args.debug:
             meta = preflight.json()
             print(f"[debug] printer ok: {meta.get('id')} {meta.get('displayName')}", file=sys.stderr)
+
+        # Check printer capabilities and supported content types
+        if args.debug:
+            capabilities = _get_printer_capabilities(token, args.printer_id, debug=args.debug)
+            content_types = capabilities.get("contentTypes") or []
+            if content_types:
+                content_type_to_check, _ = detect_content_type(args.file_path, args.content_type, debug=False)
+                if content_type_to_check not in content_types:
+                    print(f"[debug] WARNING: Content type '{content_type_to_check}' may not be supported by printer", file=sys.stderr)
+                    print(f"[debug] Supported types: {json.dumps(content_types, separators=(',', ':'), ensure_ascii=False)}", file=sys.stderr)
 
         # Build job configuration from printer defaults to avoid 400 Missing configuration
         defaults = _get_printer_defaults(token, args.printer_id, debug=args.debug)

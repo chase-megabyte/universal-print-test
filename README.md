@@ -7,9 +7,10 @@ This small CLI creates a Universal Print job for a given printer, uploads a docu
 - Azure AD tenant and a Universal Print-enabled subscription
 - A registered application in Microsoft Entra ID (Azure AD) with a client secret
 - Application permissions granted (admin consent):
-  - Printer.Read.All
-  - PrintJob.ReadWrite.All
-  - PrintJob.Manage.All
+  - **Printer.Read.All** (required)
+  - **PrintJob.ReadWrite.All** (required)
+  - **PrintJob.Manage.All** (required)
+  - **PrinterShare.ReadWrite.All** (strongly recommended - often needed to add documents to print jobs)
   - Files.ReadWrite.All is NOT needed for Universal Print upload sessions
 - A target Universal Print `printerId` and a printable file (PDF/XPS are recommended)
 
@@ -59,9 +60,28 @@ python up_print.py --poll
 
 #### Debugging 404 on createUploadSession / create document
 
-- The script uses only printer endpoints. With `--debug`, it prints full URLs.
-- If the collection upload session endpoint is unsupported or returns an error, the script falls back to creating a document, then creates an upload session for that document, all under `/print/printers/{printerId}/jobs/{jobId}`.
-- All Graph failures include `request-id`/`client-request-id` and error codes/messages in the debug output to speed up support cases.
+A common issue is receiving 404 errors when trying to create documents or upload sessions after successfully creating a print job. This can happen due to:
+
+1. **Missing `PrinterShare.ReadWrite.All` permission**: Even though the job was created successfully with `PrintJob.ReadWrite.All`, some environments require `PrinterShare.ReadWrite.All` to add documents to jobs. Add this permission in your app registration and grant admin consent.
+
+2. **Unsupported document format**: The printer may not support the document format you're uploading (e.g., `application/pdf`). Use `--debug` to see the printer's supported content types. Some printers only support `application/oxps`. Consider converting your document to a supported format.
+
+3. **API endpoint variations**: The script tries multiple approaches:
+   - First, it attempts `/print/printers/{printerId}/jobs/{jobId}/documents/createUploadSession` (collection-level upload session)
+   - If that fails (404), it falls back to creating a document first, then creating an upload session for that document
+   - With `--debug`, it also attempts the alternative `/print/jobs/{jobId}/documents` endpoint
+
+4. **Permission scope mismatch**: If using delegated permissions (device code flow with `--auth device`), ensure your account has access to the printer. Application permissions require: `Printer.Read.All`, `PrintJob.ReadWrite.All`, `PrintJob.Manage.All`, and ideally `PrinterShare.ReadWrite.All`.
+
+**Recommended solution**: Add `PrinterShare.ReadWrite.All` to your app registration's application permissions and grant admin consent. This permission is often required for document operations on print jobs.
+
+With `--debug`, the script now:
+- Prints full URLs for all API calls
+- Shows the complete error response body including the Graph error details
+- Attempts to verify the job via both `/print/printers/{printerId}/jobs/{jobId}` and `/print/jobs/{jobId}` endpoints
+- Shows printer capabilities and supported content types
+- Attempts alternative endpoints if the primary ones fail
+- Includes `request-id`/`client-request-id` for all failures to speed up support cases
 
 ### What the script does
 
