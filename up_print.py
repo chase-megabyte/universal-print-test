@@ -36,6 +36,41 @@ def get_access_token(tenant_id: str, client_id: str, client_secret: str) -> str:
     return result["access_token"]
 
 
+def get_user_token_device_code(tenant_id: str, client_id: str, scopes: List[str], cache_path: Optional[str] = None) -> str:
+    authority = f"https://login.microsoftonline.com/{tenant_id}"
+    token_cache: Optional[msal.SerializableTokenCache] = None
+    if cache_path:
+        token_cache = msal.SerializableTokenCache()
+        if os.path.exists(cache_path):
+            try:
+                token_cache.deserialize(open(cache_path, "r").read())
+            except Exception:  # noqa: BLE001
+                pass
+    app = msal.PublicClientApplication(
+        client_id=client_id,
+        authority=authority,
+        token_cache=token_cache,
+    )
+    accounts = app.get_accounts()
+    result: Optional[Dict[str, Any]] = None
+    if accounts:
+        result = app.acquire_token_silent(scopes, account=accounts[0])
+    if not result:
+        flow = app.initiate_device_flow(scopes=scopes)
+        if "user_code" not in flow:
+            raise RuntimeError(f"Failed to initiate device code flow: {flow}")
+        print(flow["message"])  # prompts user to visit URL and enter code
+        result = app.acquire_token_by_device_flow(flow)
+    if not result or "access_token" not in result:
+        raise RuntimeError(f"Failed to acquire user token: {result}")
+    if token_cache and cache_path:
+        try:
+            open(cache_path, "w").write(token_cache.serialize())
+        except Exception:  # noqa: BLE001
+            pass
+    return result["access_token"]
+
+
 def _base64url_decode(data: str) -> bytes:
     padding = '=' * (-len(data) % 4)
     return base64.urlsafe_b64decode(data + padding)
@@ -267,18 +302,23 @@ def main() -> int:
     parser.add_argument("--poll", action="store_true", help="Poll job status until completion")
     parser.add_argument("--content-type", dest="content_type", default=None, help="Override document contentType (e.g., application/pdf)")
     parser.add_argument("--debug", action="store_true", help="Print token claims and verbose diagnostics")
+    parser.add_argument("--auth", choices=["app", "device"], default=os.getenv("AUTH", "app"), help="Authentication mode: app (client credentials) or device (device code delegated)")
+    parser.add_argument("--scopes", nargs="*", default=os.getenv("SCOPES", "PrinterShare.ReadWrite.All offline_access").split(), help="Delegated scopes for device auth (space-separated)")
+    parser.add_argument("--cache-path", default=os.getenv("MSAL_CACHE_PATH", os.path.expanduser("~/.msal_up_cli_cache.json")), help="Path to MSAL token cache for device auth")
     parser.add_argument("--tenant-id", default=os.getenv("TENANT_ID"), help="Azure AD tenant ID")
     parser.add_argument("--client-id", default=os.getenv("CLIENT_ID"), help="App registration client ID")
     parser.add_argument("--client-secret", default=os.getenv("CLIENT_SECRET"), help="App registration client secret")
     args = parser.parse_args()
 
-    missing = [name for name, val in [
+    required_base = [
         ("--tenant-id", args.tenant_id),
         ("--client-id", args.client_id),
-        ("--client-secret", args.client_secret),
         ("--printer-id", args.printer_id),
         ("--file", args.file_path),
-    ] if not val]
+    ]
+    if args.auth == "app":
+        required_base.append(("--client-secret", args.client_secret))
+    missing = [name for name, val in required_base if not val]
     if missing:
         print(f"Missing required arguments: {' '.join(missing)}", file=sys.stderr)
         return 2
@@ -287,7 +327,10 @@ def main() -> int:
         return 2
 
     try:
-        token = get_access_token(args.tenant_id, args.client_id, args.client_secret)
+        if args.auth == "app":
+            token = get_access_token(args.tenant_id, args.client_id, args.client_secret)
+        else:
+            token = get_user_token_device_code(args.tenant_id, args.client_id, args.scopes, cache_path=args.cache_path)
         if args.debug:
             debug_print_token_claims(token)
 
