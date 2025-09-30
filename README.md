@@ -40,6 +40,7 @@ python up_print.py \
   --file "/absolute/path/to/document.pdf" \
   --content-type "application/pdf" \
   --job-name "My Graph UP Job" \
+  --debug \
   --poll
 ```
 
@@ -48,6 +49,12 @@ If you populated `.env`, this is sufficient:
 ```bash
 python up_print.py --poll
 ```
+
+#### Debugging 403 errors
+
+- Use `--debug` to print token claims (audience, tenant, roles) and validate the printer with a preflight GET.
+- Required Graph Application permissions (admin consent): `Printer.Read.All`, `PrintJob.ReadWrite.All`.
+- After granting consent, wait a couple minutes and retry.
 
 ### What the script does
 
