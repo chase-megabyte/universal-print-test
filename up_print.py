@@ -288,19 +288,32 @@ def create_document_and_upload_session(
         except Exception:  # noqa: BLE001
             pass
         
-        # Also try to access via the global print/jobs endpoint
+        # Also try to access via the shares endpoint as alternative
         try:
-            global_job_url = f"{GRAPH_BASE_URL}/print/jobs/{job_id}?$select=id,createdDateTime,status"
-            global_job_resp = requests.get(global_job_url, headers=graph_headers(token), timeout=30)
-            if global_job_resp.status_code == 200:
-                global_job_meta = global_job_resp.json() or {}
-                print(f"[debug] global job lookup ok: {global_job_meta.get('id')}", file=sys.stderr)
+            # Try to discover shares for this printer
+            shares_url = f"{GRAPH_BASE_URL}/print/shares?$filter=printer/id eq '{printer_id}'"
+            shares_resp = requests.get(shares_url, headers=graph_headers(token), timeout=30)
+            if shares_resp.status_code == 200:
+                shares_data = shares_resp.json() or {}
+                shares = shares_data.get("value") or []
+                if shares:
+                    share_id = shares[0].get("id")
+                    print(f"[debug] discovered printer share: {share_id}", file=sys.stderr)
+                    # Try to access job via share endpoint
+                    share_job_url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs/{job_id}?$select=id,createdDateTime,status"
+                    share_job_resp = requests.get(share_job_url, headers=graph_headers(token), timeout=30)
+                    if share_job_resp.status_code == 200:
+                        print(f"[debug] job accessible via share endpoint", file=sys.stderr)
+                    else:
+                        print(f"[debug] share job lookup failed: {_build_graph_error_message('Get share job', share_job_resp)}", file=sys.stderr)
+                else:
+                    print(f"[debug] no shares found for printer", file=sys.stderr)
             else:
-                print(f"[debug] global job lookup failed: {_build_graph_error_message('Get global job', global_job_resp)}", file=sys.stderr)
+                print(f"[debug] shares discovery failed: {_build_graph_error_message('List shares', shares_resp)}", file=sys.stderr)
         except Exception:  # noqa: BLE001
             pass
 
-    # Preferred: create an upload session on the documents collection (no pre-created document)
+    # Strategy 1: Try the modern createUploadSession on documents collection
     collection_session_url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs/{job_id}/documents/createUploadSession"
     collection_payload = {
         "documentName": file_name,
@@ -310,7 +323,8 @@ def create_document_and_upload_session(
     try:
         if debug:
             try:
-                print(f"[debug] POST {collection_session_url} body={json.dumps(collection_payload, separators=(',', ':'), ensure_ascii=False)}", file=sys.stderr)
+                print(f"[debug] Strategy 1: POST {collection_session_url}", file=sys.stderr)
+                print(f"[debug] body={json.dumps(collection_payload, separators=(',', ':'), ensure_ascii=False)}", file=sys.stderr)
             except Exception:  # noqa: BLE001
                 pass
         session_resp = requests.post(collection_session_url, headers=graph_headers(token), json=collection_payload, timeout=60)
@@ -323,60 +337,107 @@ def create_document_and_upload_session(
                 or upload_session.get("id")
             )
             upload_url = upload_session.get("uploadUrl")
-            if not upload_url:
-                raise RuntimeError("uploadUrl missing in upload session response")
-            return document_id or "", upload_url
-        # If not supported (older tenant/connector), fall back to legacy two-step flow
+            if upload_url:
+                if debug:
+                    print(f"[debug] Strategy 1 succeeded", file=sys.stderr)
+                return document_id or "", upload_url
+        # Strategy failed
         if debug:
             try:
                 err_details = _extract_graph_error(session_resp)
-                print(f"[debug] collection createUploadSession failed: {_build_graph_error_message('Create upload session (collection)', session_resp)}", file=sys.stderr)
+                print(f"[debug] Strategy 1 failed: {_build_graph_error_message('Create upload session (collection)', session_resp)}", file=sys.stderr)
                 if err_details.get("raw_response"):
                     print(f"[debug] response body: {json.dumps(err_details['raw_response'], separators=(',', ':'), ensure_ascii=False)}", file=sys.stderr)
-                print(f"[debug] falling back to create document flow", file=sys.stderr)
             except Exception:  # noqa: BLE001
                 pass
-    except Exception:  # noqa: BLE001
-        # Proceed to fallback below
-        pass
+    except Exception as e:  # noqa: BLE001
+        if debug:
+            print(f"[debug] Strategy 1 exception: {e}", file=sys.stderr)
 
-    # Fallback: create document, then create an upload session on that document
+    # Strategy 2: Legacy two-step flow - create document first
     doc_url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs/{job_id}/documents"
     doc_payload = {"displayName": file_name, "contentType": effective_content_type}
     if debug:
         try:
-            print(f"[debug] POST {doc_url} body={json.dumps(doc_payload, separators=(',', ':'), ensure_ascii=False)}", file=sys.stderr)
+            print(f"[debug] Strategy 2: POST {doc_url}", file=sys.stderr)
+            print(f"[debug] body={json.dumps(doc_payload, separators=(',', ':'), ensure_ascii=False)}", file=sys.stderr)
         except Exception:  # noqa: BLE001
             pass
+    
     doc_resp = requests.post(doc_url, headers=graph_headers(token), json=doc_payload, timeout=60)
+    
+    # Strategy 2 failed, try Strategy 3: Use shares endpoint if available
     if doc_resp.status_code not in (200, 201):
-        err_msg = _build_graph_error_message("Create document", doc_resp)
         if debug:
             try:
                 err_details = _extract_graph_error(doc_resp)
+                print(f"[debug] Strategy 2 failed: {_build_graph_error_message('Create document', doc_resp)}", file=sys.stderr)
                 if err_details.get("raw_response"):
-                    print(f"[debug] create document response body: {json.dumps(err_details['raw_response'], separators=(',', ':'), ensure_ascii=False)}", file=sys.stderr)
-                
-                # Try alternative endpoint via /print/jobs
-                print(f"[debug] attempting alternative endpoint via /print/jobs/{job_id}/documents", file=sys.stderr)
-                alt_doc_url = f"{GRAPH_BASE_URL}/print/jobs/{job_id}/documents"
-                alt_doc_resp = requests.post(alt_doc_url, headers=graph_headers(token), json=doc_payload, timeout=60)
-                if alt_doc_resp.status_code in (200, 201):
-                    print(f"[debug] alternative endpoint succeeded!", file=sys.stderr)
-                    doc_resp = alt_doc_resp  # Use the alternative response
-                else:
-                    print(f"[debug] alternative endpoint also failed: {_build_graph_error_message('Create document (alt)', alt_doc_resp)}", file=sys.stderr)
+                    print(f"[debug] response body: {json.dumps(err_details['raw_response'], separators=(',', ':'), ensure_ascii=False)}", file=sys.stderr)
             except Exception:  # noqa: BLE001
                 pass
         
-        # Only raise if alternative didn't work
-        if doc_resp.status_code not in (200, 201):
-            raise RuntimeError(err_msg)
+        # Strategy 3: Try to use printer share endpoint
+        try:
+            if debug:
+                print(f"[debug] Strategy 3: Attempting via printer share endpoint", file=sys.stderr)
+            
+            # First, discover the share ID for this printer
+            shares_url = f"{GRAPH_BASE_URL}/print/shares?$filter=printer/id eq '{printer_id}'"
+            shares_resp = requests.get(shares_url, headers=graph_headers(token), timeout=30)
+            
+            if shares_resp.status_code == 200:
+                shares_data = shares_resp.json() or {}
+                shares = shares_data.get("value") or []
+                
+                if shares:
+                    share_id = shares[0].get("id")
+                    if debug:
+                        print(f"[debug] using share ID: {share_id}", file=sys.stderr)
+                    
+                    # Try to create document via share endpoint
+                    share_doc_url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs/{job_id}/documents"
+                    if debug:
+                        print(f"[debug] POST {share_doc_url}", file=sys.stderr)
+                    
+                    share_doc_resp = requests.post(share_doc_url, headers=graph_headers(token), json=doc_payload, timeout=60)
+                    
+                    if share_doc_resp.status_code in (200, 201):
+                        if debug:
+                            print(f"[debug] Strategy 3 succeeded!", file=sys.stderr)
+                        doc_resp = share_doc_resp  # Use this response
+                    else:
+                        if debug:
+                            print(f"[debug] Strategy 3 failed: {_build_graph_error_message('Create document (share)', share_doc_resp)}", file=sys.stderr)
+                else:
+                    if debug:
+                        print(f"[debug] Strategy 3 skipped: no shares found", file=sys.stderr)
+            else:
+                if debug:
+                    print(f"[debug] Strategy 3 skipped: shares discovery failed", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001
+            if debug:
+                print(f"[debug] Strategy 3 exception: {e}", file=sys.stderr)
+    
+    # Check if any strategy for document creation worked
+    if doc_resp.status_code not in (200, 201):
+        err_msg = _build_graph_error_message("Create document", doc_resp)
+        raise RuntimeError(f"{err_msg}\n\nAll strategies failed. This may indicate:\n"
+                         "1. Missing PrinterShare.ReadWrite.All permission\n"
+                         "2. Job was created but is not accessible for document upload\n"
+                         "3. Printer or connector configuration issue\n"
+                         "4. API version incompatibility\n\n"
+                         "Try running with --debug for detailed diagnostics.")
+    
     document = doc_resp.json() or {}
     document_id = document.get("id")
     if not document_id:
         raise RuntimeError("Document ID missing in create document response")
+    
+    if debug:
+        print(f"[debug] document created: {document_id}", file=sys.stderr)
 
+    # Now create upload session for the document
     session_url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs/{job_id}/documents/{document_id}/createUploadSession"
     if debug:
         try:
