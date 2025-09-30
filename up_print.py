@@ -293,8 +293,19 @@ def create_document_and_upload_session(token: str, share_id: str, job_id: str, f
         except Exception:  # noqa: BLE001
             pass
 
-    # 1) Create document on the job
-    doc_url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs/{job_id}/documents"
+    # Optional: verify the job exists (helps diagnose bad IDs or scope mismatches)
+    if debug:
+        try:
+            job_url = f"{GRAPH_BASE_URL}/print/jobs/{job_id}?$select=id,createdDateTime"
+            job_resp = requests.get(job_url, headers=graph_headers(token), timeout=30)
+            if job_resp.status_code == 200:
+                job_meta = job_resp.json() or {}
+                print(f"[debug] job ok: {job_meta.get('id')}", file=sys.stderr)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 1) Create document on the job using job-scoped endpoint (works for printer or share created jobs)
+    doc_url = f"{GRAPH_BASE_URL}/print/jobs/{job_id}/documents"
     doc_payload = {"displayName": file_name, "contentType": effective_content_type}
     doc_resp = requests.post(doc_url, headers=graph_headers(token), json=doc_payload, timeout=60)
     if doc_resp.status_code not in (200, 201):
@@ -304,8 +315,8 @@ def create_document_and_upload_session(token: str, share_id: str, job_id: str, f
     if not document_id:
         raise RuntimeError("Document ID missing in create document response")
 
-    # 2) Create upload session
-    session_url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs/{job_id}/documents/{document_id}/createUploadSession"
+    # 2) Create upload session via job-scoped endpoint
+    session_url = f"{GRAPH_BASE_URL}/print/jobs/{job_id}/documents/{document_id}/createUploadSession"
     session_resp = requests.post(session_url, headers=graph_headers(token), json={}, timeout=60)
     if session_resp.status_code not in (200, 201):
         raise RuntimeError(_build_graph_error_message("Create upload session", session_resp))
