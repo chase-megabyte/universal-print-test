@@ -58,6 +58,15 @@ python up_print.py --poll
 - After granting consent, wait a couple minutes and retry.
 - If using app-only, create jobs on a printer share: the script now resolves the first share for the printer (or use `--share-id`). Ensure the app's service principal has access to that share (via a group or direct assignment) in the Universal Print portal.
 
+#### Debugging 404 on createUploadSession / create document
+
+- Use `--debug` to see exactly which base path is used and the full URLs:
+  - The script creates jobs under `/print/shares/{shareId}/jobs` and attempts upload under the same share path.
+  - It first checks job existence under the share path and, if `--debug` is on and `--printer-id` is provided, also probes the printer path for extra context.
+- If the collection upload session endpoint is unsupported or returns an error, the script falls back to creating a document, logging the exact POST URL and payload.
+- If `Create document` returns 404 on the share path, the script will (with `--printer-id` present) try the equivalent printer path automatically and log this switch when `--debug` is enabled.
+- All Graph failures include `request-id`/`client-request-id` and error codes/messages in the debug output to speed up support cases.
+
 ### What the script does
 
 1. Obtains an app-only token using MSAL (`client_credentials`) for the `https://graph.microsoft.com/.default` scope.

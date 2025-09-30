@@ -284,7 +284,16 @@ def create_print_job(token: str, share_id: str, job_name: str, job_configuration
     return resp.json()
 
 
-def create_document_and_upload_session(token: str, share_id: str, job_id: str, file_path: str, content_type: Optional[str], debug: bool = False) -> Tuple[str, str]:
+def create_document_and_upload_session(
+    token: str,
+    share_id: str,
+    job_id: str,
+    file_path: str,
+    content_type: Optional[str],
+    debug: bool = False,
+    printer_id: Optional[str] = None,
+    try_printer_path_on_404: bool = False,
+) -> Tuple[str, str]:
     file_name = os.path.basename(file_path)
     effective_content_type, ctype_source = detect_content_type(file_path, content_type, debug=debug)
     if debug:
@@ -296,11 +305,22 @@ def create_document_and_upload_session(token: str, share_id: str, job_id: str, f
     # Optional: verify the job exists (helps diagnose bad IDs or scope mismatches)
     if debug:
         try:
-            job_url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs/{job_id}?$select=id,createdDateTime"
-            job_resp = requests.get(job_url, headers=graph_headers(token), timeout=30)
-            if job_resp.status_code == 200:
-                job_meta = job_resp.json() or {}
+            share_job_url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs/{job_id}?$select=id,createdDateTime"
+            share_job_resp = requests.get(share_job_url, headers=graph_headers(token), timeout=30)
+            if share_job_resp.status_code == 200:
+                job_meta = share_job_resp.json() or {}
                 print(f"[debug] job ok: {job_meta.get('id')}", file=sys.stderr)
+            else:
+                print(f"[debug] share job lookup failed: {_build_graph_error_message('Get share job', share_job_resp)}", file=sys.stderr)
+            if printer_id:
+                printer_job_url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs/{job_id}?$select=id,createdDateTime"
+                printer_job_resp = requests.get(printer_job_url, headers=graph_headers(token), timeout=30)
+                if printer_job_resp.status_code == 200:
+                    job_meta = printer_job_resp.json() or {}
+                    print(f"[debug] printer-path job exists too: {job_meta.get('id')}", file=sys.stderr)
+                else:
+                    # This helps confirm the correct base segment to use
+                    print(f"[debug] printer job lookup: {_build_graph_error_message('Get printer job', printer_job_resp)}", file=sys.stderr)
         except Exception:  # noqa: BLE001
             pass
 
@@ -308,6 +328,11 @@ def create_document_and_upload_session(token: str, share_id: str, job_id: str, f
     collection_session_url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs/{job_id}/documents/createUploadSession"
     collection_payload = {"documentName": file_name, "contentType": effective_content_type}
     try:
+        if debug:
+            try:
+                print(f"[debug] POST {collection_session_url} body={json.dumps(collection_payload, separators=(',', ':'), ensure_ascii=False)}", file=sys.stderr)
+            except Exception:  # noqa: BLE001
+                pass
         session_resp = requests.post(collection_session_url, headers=graph_headers(token), json=collection_payload, timeout=60)
         if session_resp.status_code in (200, 201):
             upload_session = session_resp.json() or {}
@@ -324,10 +349,8 @@ def create_document_and_upload_session(token: str, share_id: str, job_id: str, f
         # If not supported (older tenant/connector), fall back to legacy two-step flow
         if debug:
             try:
-                print(
-                    f"[debug] collection createUploadSession returned {session_resp.status_code}; falling back to create document flow",
-                    file=sys.stderr,
-                )
+                print(f"[debug] collection createUploadSession failed: {_build_graph_error_message('Create upload session (collection)', session_resp)}", file=sys.stderr)
+                print(f"[debug] falling back to create document flow", file=sys.stderr)
             except Exception:  # noqa: BLE001
                 pass
     except Exception:  # noqa: BLE001
@@ -337,8 +360,43 @@ def create_document_and_upload_session(token: str, share_id: str, job_id: str, f
     # Fallback: create document, then create an upload session on that document
     doc_url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs/{job_id}/documents"
     doc_payload = {"displayName": file_name, "contentType": effective_content_type}
+    if debug:
+        try:
+            print(f"[debug] POST {doc_url} body={json.dumps(doc_payload, separators=(',', ':'), ensure_ascii=False)}", file=sys.stderr)
+        except Exception:  # noqa: BLE001
+            pass
     doc_resp = requests.post(doc_url, headers=graph_headers(token), json=doc_payload, timeout=60)
     if doc_resp.status_code not in (200, 201):
+        # Optional printer-path fallback if explicitly requested
+        if try_printer_path_on_404 and doc_resp.status_code == 404 and printer_id:
+            printer_doc_url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs/{job_id}/documents"
+            if debug:
+                try:
+                    print(f"[debug] share path Create document returned 404; trying printer path: {printer_doc_url}", file=sys.stderr)
+                except Exception:  # noqa: BLE001
+                    pass
+            printer_doc_resp = requests.post(printer_doc_url, headers=graph_headers(token), json=doc_payload, timeout=60)
+            if printer_doc_resp.status_code in (200, 201):
+                document = printer_doc_resp.json() or {}
+                document_id = document.get("id")
+                if not document_id:
+                    raise RuntimeError("Document ID missing in create document response (printer path)")
+                session_url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs/{job_id}/documents/{document_id}/createUploadSession"
+                if debug:
+                    try:
+                        print(f"[debug] POST {session_url} body={{}}", file=sys.stderr)
+                    except Exception:  # noqa: BLE001
+                        pass
+                session_resp = requests.post(session_url, headers=graph_headers(token), json={}, timeout=60)
+                if session_resp.status_code not in (200, 201):
+                    raise RuntimeError(_build_graph_error_message("Create upload session (printer path)", session_resp))
+                upload_session = session_resp.json() or {}
+                upload_url = upload_session.get("uploadUrl")
+                if not upload_url:
+                    raise RuntimeError("uploadUrl missing in upload session response (printer path)")
+                return document_id, upload_url
+            else:
+                raise RuntimeError(_build_graph_error_message("Create document (printer path)", printer_doc_resp))
         raise RuntimeError(_build_graph_error_message("Create document", doc_resp))
     document = doc_resp.json() or {}
     document_id = document.get("id")
@@ -346,6 +404,11 @@ def create_document_and_upload_session(token: str, share_id: str, job_id: str, f
         raise RuntimeError("Document ID missing in create document response")
 
     session_url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs/{job_id}/documents/{document_id}/createUploadSession"
+    if debug:
+        try:
+            print(f"[debug] POST {session_url} body={{}}", file=sys.stderr)
+        except Exception:  # noqa: BLE001
+            pass
     session_resp = requests.post(session_url, headers=graph_headers(token), json={}, timeout=60)
     if session_resp.status_code not in (200, 201):
         raise RuntimeError(_build_graph_error_message("Create upload session", session_resp))
@@ -548,7 +611,16 @@ def main() -> int:
             raise RuntimeError("Job ID missing in create job response")
         print(f"Created job {job_id}")
 
-        _, upload_url = create_document_and_upload_session(token, share_id, job_id, args.file_path, args.content_type, debug=args.debug)
+        _, upload_url = create_document_and_upload_session(
+            token,
+            share_id,
+            job_id,
+            args.file_path,
+            args.content_type,
+            debug=args.debug,
+            printer_id=args.printer_id,
+            try_printer_path_on_404=True,
+        )
         print("Uploading document...")
         upload_file_to_upload_session(upload_url, args.file_path)
         print("Upload complete.")
