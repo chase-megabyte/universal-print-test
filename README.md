@@ -38,7 +38,6 @@ You can pass args or rely on `.env` values.
 ```bash
 python up_print.py \
   --printer-id "<printer-guid>" \
-  --share-id "<printer-share-guid>" \  # optional; will auto-resolve if omitted
   --file "/absolute/path/to/document.pdf" \
   --job-name "My Graph UP Job" \
   --debug \
@@ -56,24 +55,21 @@ python up_print.py --poll
 - Use `--debug` to print token claims (audience, tenant, roles) and validate the printer with a preflight GET.
 - Required Graph Application permissions (admin consent): `Printer.Read.All`, `PrintJob.ReadWrite.All`, `PrintJob.Manage.All`.
 - After granting consent, wait a couple minutes and retry.
-- If using app-only, create jobs on a printer share: the script now resolves the first share for the printer (or use `--share-id`). Ensure the app's service principal has access to that share (via a group or direct assignment) in the Universal Print portal.
+  
 
 #### Debugging 404 on createUploadSession / create document
 
-- Use `--debug` to see exactly which base path is used and the full URLs:
-  - The script creates jobs under `/print/shares/{shareId}/jobs` and attempts upload under the same share path.
-  - It first checks job existence under the share path and, if `--debug` is on and `--printer-id` is provided, also probes the printer path for extra context.
-- If the collection upload session endpoint is unsupported or returns an error, the script falls back to creating a document, logging the exact POST URL and payload.
-- If `Create document` returns 404 on the share path, the script will (with `--printer-id` present) try the equivalent printer path automatically and log this switch when `--debug` is enabled.
+- The script uses only printer endpoints. With `--debug`, it prints full URLs.
+- If the collection upload session endpoint is unsupported or returns an error, the script falls back to creating a document, then creates an upload session for that document, all under `/print/printers/{printerId}/jobs/{jobId}`.
 - All Graph failures include `request-id`/`client-request-id` and error codes/messages in the debug output to speed up support cases.
 
 ### What the script does
 
-1. Obtains an app-only token using MSAL (`client_credentials`) for the `https://graph.microsoft.com/.default` scope.
-2. Resolves/validates a printer share and creates a print job under `/print/shares/{shareId}/jobs`.
+1. Obtains an app-only or delegated token using MSAL.
+2. Creates a print job under `/print/printers/{printerId}/jobs`.
 3. Fetches the printer's defaults and includes a job `configuration` to avoid 400 "Missing configuration" from some connectors.
-4. Creates an upload session on the documents collection via `/print/shares/{shareId}/jobs/{jobId}/documents/createUploadSession` (preferred), then uploads the file in chunks with `Content-Range` headers. If the collection upload session is not supported, it falls back to creating a document first and then creating an upload session for that document.
-5. Starts the job and optionally polls `/print/shares/{shareId}/jobs/{jobId}` reading `printJob.status.state` until a terminal state.
+4. Creates an upload session on the documents collection via `/print/printers/{printerId}/jobs/{jobId}/documents/createUploadSession` (preferred), then uploads the file in chunks with `Content-Range` headers. If unsupported, falls back to creating a document first and then creating an upload session for that document.
+5. Starts the job and optionally polls `/print/printers/{printerId}/jobs/{jobId}` reading `printJob.status.state` until a terminal state.
 
 ### Notes
 
