@@ -17,6 +17,14 @@ GRAPH_SCOPE = ["https://graph.microsoft.com/.default"]
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 REQUIRED_APP_ROLES = {"Printer.Read.All", "PrintJob.ReadWrite.All", "PrintJob.Manage.All"}
 
+# Ensure uncommon but relevant types are recognized by extension
+mimetypes.add_type("application/oxps", ".oxps")
+mimetypes.add_type("application/vnd.ms-xpsdocument", ".xps")
+mimetypes.add_type("application/pdf", ".pdf")
+mimetypes.add_type("image/jpeg", ".jpg")
+mimetypes.add_type("image/jpeg", ".jpeg")
+mimetypes.add_type("image/png", ".png")
+
 
 def load_env() -> None:
     # Load .env if present; environment variables take precedence
@@ -162,6 +170,75 @@ def graph_headers(token: str) -> Dict[str, str]:
     }
 
 
+def _sniff_magic_content_type(file_path: str) -> Optional[str]:
+    """Best-effort magic-byte MIME sniffing for common printable formats.
+
+    This intentionally focuses on formats commonly supported by Universal Print
+    (PDF, JPEG, PNG, GIF, TIFF, PostScript, XPS/OXPS by extension disambiguation).
+    """
+    try:
+        with open(file_path, "rb") as f:
+            header = f.read(16)
+    except Exception:  # noqa: BLE001
+        return None
+
+    if header.startswith(b"%PDF-"):
+        return "application/pdf"
+    if header.startswith(b"\xFF\xD8\xFF"):
+        return "image/jpeg"
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if header.startswith(b"GIF87a") or header.startswith(b"GIF89a"):
+        return "image/gif"
+    if header.startswith(b"II*\x00") or header.startswith(b"MM\x00*"):
+        return "image/tiff"
+    if header.startswith(b"%!PS-"):
+        return "application/postscript"
+
+    # ZIP container (docx/xlsx/pptx/oxps/xps). Disambiguate by extension only.
+    if header.startswith(b"PK\x03\x04") or header.startswith(b"PK\x05\x06") or header.startswith(b"PK\x07\x08"):
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext == ".docx":
+            return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        if ext == ".xlsx":
+            return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        if ext == ".pptx":
+            return "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        if ext == ".oxps":
+            return "application/oxps"
+        if ext == ".xps":
+            return "application/vnd.ms-xpsdocument"
+        # Unknown ZIP-based format; let caller handle fallback
+        return None
+
+    return None
+
+
+def detect_content_type(file_path: str, explicit_content_type: Optional[str], debug: bool = False) -> Tuple[str, str]:
+    """Determine the best contentType for a document.
+
+    Order of precedence:
+    1) Explicit override from CLI/env
+    2) Extension-based guess via mimetypes
+    3) Magic-byte sniffing for common formats
+    4) Fallback to application/octet-stream
+
+    Returns a tuple of (content_type, source) where source describes how it was determined.
+    """
+    if explicit_content_type:
+        return explicit_content_type, "override"
+
+    guessed_type, _ = mimetypes.guess_type(file_path)
+    if guessed_type and guessed_type != "application/octet-stream":
+        return guessed_type, "extension"
+
+    sniffed = _sniff_magic_content_type(file_path)
+    if sniffed:
+        return sniffed, "magic"
+
+    return "application/octet-stream", "fallback"
+
+
 def _validate_share_exists(token: str, share_id: str, debug: bool = False) -> Tuple[str, Optional[str]]:
     url = f"{GRAPH_BASE_URL}/print/shares/{share_id}?$select=id,displayName"
     resp = requests.get(url, headers=graph_headers(token), timeout=30)
@@ -207,10 +284,14 @@ def create_print_job(token: str, share_id: str, job_name: str, job_configuration
     return resp.json()
 
 
-def create_document_and_upload_session(token: str, share_id: str, job_id: str, file_path: str, content_type: Optional[str]) -> Tuple[str, str]:
+def create_document_and_upload_session(token: str, share_id: str, job_id: str, file_path: str, content_type: Optional[str], debug: bool = False) -> Tuple[str, str]:
     file_name = os.path.basename(file_path)
-    guessed_type, _ = mimetypes.guess_type(file_path)
-    effective_content_type = content_type or guessed_type or "application/octet-stream"
+    effective_content_type, ctype_source = detect_content_type(file_path, content_type, debug=debug)
+    if debug:
+        try:
+            print(f"[debug] resolved contentType: {effective_content_type} (source={ctype_source})", file=sys.stderr)
+        except Exception:  # noqa: BLE001
+            pass
 
     # 1) Create document on the job
     doc_url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs/{job_id}/documents"
@@ -427,7 +508,7 @@ def main() -> int:
             raise RuntimeError("Job ID missing in create job response")
         print(f"Created job {job_id}")
 
-        _, upload_url = create_document_and_upload_session(token, share_id, job_id, args.file_path, args.content_type)
+        _, upload_url = create_document_and_upload_session(token, share_id, job_id, args.file_path, args.content_type, debug=args.debug)
         print("Uploading document...")
         upload_file_to_upload_session(upload_url, args.file_path)
         print("Upload complete.")

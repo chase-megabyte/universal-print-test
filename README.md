@@ -40,7 +40,6 @@ python up_print.py \
   --printer-id "<printer-guid>" \
   --share-id "<printer-share-guid>" \  # optional; will auto-resolve if omitted
   --file "/absolute/path/to/document.pdf" \
-  --content-type "application/pdf" \
   --job-name "My Graph UP Job" \
   --debug \
   --poll
@@ -72,6 +71,12 @@ python up_print.py --poll
 - Use files that your printer supports (PDF/XPS preferred). Office formats may require conversion.
 - Ensure the service principal of your app has access to the tenant and Universal Print. Some tenants restrict Universal Print to specific groups.
 - The script prints basic status lines; you can extend error handling and logging as needed.
+
+#### Content type detection
+
+- The script now auto-detects the document `contentType` using extension and magic-byte sniffing for common formats (PDF, JPEG, PNG, GIF, TIFF, PS, XPS/OXPS).
+- You can still override detection with `--content-type` (e.g., `--content-type application/pdf`).
+- Use `--debug` to see the resolved `contentType` and its detection source.
 
 #### About 400 "Missing configuration"
 
