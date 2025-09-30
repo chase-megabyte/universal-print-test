@@ -63,7 +63,7 @@ python up_print.py --poll
 1. Obtains an app-only token using MSAL (`client_credentials`) for the `https://graph.microsoft.com/.default` scope.
 2. Resolves/validates a printer share and creates a print job under `/print/shares/{shareId}/jobs`.
 3. Fetches the printer's defaults and includes a job `configuration` to avoid 400 "Missing configuration" from some connectors.
-4. Creates a document (setting `contentType`) and an upload session, then uploads the file in chunks with `Content-Range` headers.
+4. Creates an upload session on the documents collection via `/print/shares/{shareId}/jobs/{jobId}/documents/createUploadSession` (preferred), then uploads the file in chunks with `Content-Range` headers. If the collection upload session is not supported, it falls back to creating a document first and then creating an upload session for that document.
 5. Starts the job and optionally polls `/print/shares/{shareId}/jobs/{jobId}` reading `printJob.status.state` until a terminal state.
 
 ### Notes

@@ -304,23 +304,52 @@ def create_document_and_upload_session(token: str, share_id: str, job_id: str, f
         except Exception:  # noqa: BLE001
             pass
 
-    # 1) Create document on the job using share-scoped endpoint
+    # Preferred: create an upload session on the documents collection (no pre-created document)
+    collection_session_url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs/{job_id}/documents/createUploadSession"
+    collection_payload = {"documentName": file_name, "contentType": effective_content_type}
+    try:
+        session_resp = requests.post(collection_session_url, headers=graph_headers(token), json=collection_payload, timeout=60)
+        if session_resp.status_code in (200, 201):
+            upload_session = session_resp.json() or {}
+            # Try multiple shapes for document id for robustness across API surfaces
+            document_id = (
+                upload_session.get("documentId")
+                or (upload_session.get("document") or {}).get("id")
+                or upload_session.get("id")
+            )
+            upload_url = upload_session.get("uploadUrl")
+            if not upload_url:
+                raise RuntimeError("uploadUrl missing in upload session response")
+            return document_id or "", upload_url
+        # If not supported (older tenant/connector), fall back to legacy two-step flow
+        if debug:
+            try:
+                print(
+                    f"[debug] collection createUploadSession returned {session_resp.status_code}; falling back to create document flow",
+                    file=sys.stderr,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        # Proceed to fallback below
+        pass
+
+    # Fallback: create document, then create an upload session on that document
     doc_url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs/{job_id}/documents"
     doc_payload = {"displayName": file_name, "contentType": effective_content_type}
     doc_resp = requests.post(doc_url, headers=graph_headers(token), json=doc_payload, timeout=60)
     if doc_resp.status_code not in (200, 201):
         raise RuntimeError(_build_graph_error_message("Create document", doc_resp))
-    document = doc_resp.json()
+    document = doc_resp.json() or {}
     document_id = document.get("id")
     if not document_id:
         raise RuntimeError("Document ID missing in create document response")
 
-    # 2) Create upload session via share-scoped endpoint
     session_url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs/{job_id}/documents/{document_id}/createUploadSession"
     session_resp = requests.post(session_url, headers=graph_headers(token), json={}, timeout=60)
     if session_resp.status_code not in (200, 201):
         raise RuntimeError(_build_graph_error_message("Create upload session", session_resp))
-    upload_session = session_resp.json()
+    upload_session = session_resp.json() or {}
     upload_url = upload_session.get("uploadUrl")
     if not upload_url:
         raise RuntimeError("uploadUrl missing in upload session response")
