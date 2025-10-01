@@ -272,15 +272,44 @@ def _discover_printer_shares(token: str, printer_id: str, debug: bool = False) -
         return []
 
 
-def create_print_job(token: str, printer_id: str, job_name: str, job_configuration: Optional[Dict[str, Any]] = None, debug: bool = False) -> Dict:
-    url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs"
+def create_print_job(token: str, printer_id: str, job_name: str, job_configuration: Optional[Dict[str, Any]] = None, debug: bool = False, share_id: Optional[str] = None) -> Dict:
+    """Create a print job via printer endpoint or share endpoint.
+    
+    Args:
+        token: Access token
+        printer_id: Printer ID
+        job_name: Display name for the job
+        job_configuration: Optional job configuration
+        debug: Enable debug output
+        share_id: Optional share ID. If provided, creates job via share endpoint instead of printer endpoint.
+    
+    Returns:
+        Job object with metadata including 'endpoint_type' ('share' or 'printer')
+    """
+    if share_id:
+        url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs"
+        endpoint_type = "share"
+        if debug:
+            print(f"[debug] Creating job via share endpoint: {share_id}", file=sys.stderr)
+    else:
+        url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs"
+        endpoint_type = "printer"
+        if debug:
+            print(f"[debug] Creating job via printer endpoint", file=sys.stderr)
+    
     payload: Dict[str, Any] = {"displayName": job_name}
     if job_configuration:
         payload["configuration"] = job_configuration
     resp = requests.post(url, headers=graph_headers(token), json=payload, timeout=60)
     if resp.status_code not in (200, 201):
         raise RuntimeError(_build_graph_error_message("Create job", resp))
-    return resp.json()
+    
+    job = resp.json()
+    # Add metadata to track which endpoint was used
+    job["_endpoint_type"] = endpoint_type
+    if share_id:
+        job["_share_id"] = share_id
+    return job
 
 
 def create_document_and_upload_session(
@@ -290,6 +319,8 @@ def create_document_and_upload_session(
     file_path: str,
     content_type: Optional[str],
     debug: bool = False,
+    endpoint_type: str = "printer",
+    share_id: Optional[str] = None,
 ) -> Tuple[str, str]:
     file_name = os.path.basename(file_path)
     effective_content_type, ctype_source = detect_content_type(file_path, content_type, debug=debug)
@@ -302,39 +333,31 @@ def create_document_and_upload_session(
     # Optional: verify the job exists (helps diagnose bad IDs or scope mismatches)
     if debug:
         try:
-            printer_job_url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs/{job_id}?$select=id,createdDateTime,status"
-            printer_job_resp = requests.get(printer_job_url, headers=graph_headers(token), timeout=30)
-            if printer_job_resp.status_code == 200:
-                job_meta = printer_job_resp.json() or {}
-                print(f"[debug] job ok: {job_meta.get('id')}", file=sys.stderr)
+            if endpoint_type == "share" and share_id:
+                job_url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs/{job_id}?$select=id,createdDateTime,status"
+                endpoint_desc = f"share ({share_id})"
+            else:
+                job_url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs/{job_id}?$select=id,createdDateTime,status"
+                endpoint_desc = "printer"
+            
+            job_resp = requests.get(job_url, headers=graph_headers(token), timeout=30)
+            if job_resp.status_code == 200:
+                job_meta = job_resp.json() or {}
+                print(f"[debug] job ok via {endpoint_desc}: {job_meta.get('id')}", file=sys.stderr)
                 job_status = job_meta.get("status") or {}
                 if job_status:
                     print(f"[debug] job status: {json.dumps(job_status, separators=(',', ':'), ensure_ascii=False)}", file=sys.stderr)
             else:
-                print(f"[debug] printer job lookup: {_build_graph_error_message('Get printer job', printer_job_resp)}", file=sys.stderr)
-        except Exception:  # noqa: BLE001
-            pass
-        
-        # Also try to access via the shares endpoint as alternative
-        try:
-            matching_shares = _discover_printer_shares(token, printer_id, debug=debug)
-            if matching_shares:
-                share_id = matching_shares[0].get("id")
-                print(f"[debug] discovered printer share: {share_id}", file=sys.stderr)
-                # Try to access job via share endpoint
-                share_job_url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs/{job_id}?$select=id,createdDateTime,status"
-                share_job_resp = requests.get(share_job_url, headers=graph_headers(token), timeout=30)
-                if share_job_resp.status_code == 200:
-                    print(f"[debug] job accessible via share endpoint", file=sys.stderr)
-                else:
-                    print(f"[debug] share job lookup failed: {_build_graph_error_message('Get share job', share_job_resp)}", file=sys.stderr)
-            else:
-                print(f"[debug] no shares found for printer", file=sys.stderr)
+                print(f"[debug] job lookup via {endpoint_desc}: {_build_graph_error_message('Get job', job_resp)}", file=sys.stderr)
         except Exception:  # noqa: BLE001
             pass
 
     # Strategy 1: Try the modern createUploadSession on documents collection
-    collection_session_url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs/{job_id}/documents/createUploadSession"
+    # Use the same endpoint type (share or printer) as was used to create the job
+    if endpoint_type == "share" and share_id:
+        collection_session_url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs/{job_id}/documents/createUploadSession"
+    else:
+        collection_session_url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs/{job_id}/documents/createUploadSession"
     collection_payload = {
         "documentName": file_name,
         "contentType": effective_content_type,
@@ -375,7 +398,12 @@ def create_document_and_upload_session(
             print(f"[debug] Strategy 1 exception: {e}", file=sys.stderr)
 
     # Strategy 2: Legacy two-step flow - create document first
-    doc_url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs/{job_id}/documents"
+    # Use the same endpoint type (share or printer) as was used to create the job
+    if endpoint_type == "share" and share_id:
+        doc_url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs/{job_id}/documents"
+    else:
+        doc_url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs/{job_id}/documents"
+    
     doc_payload = {"displayName": file_name, "contentType": effective_content_type}
     if debug:
         try:
@@ -386,8 +414,8 @@ def create_document_and_upload_session(
     
     doc_resp = requests.post(doc_url, headers=graph_headers(token), json=doc_payload, timeout=60)
     
-    # Strategy 2 failed, try Strategy 3: Use shares endpoint if available
-    if doc_resp.status_code not in (200, 201):
+    # If Strategy 2 failed and we used printer endpoint, try share endpoint as fallback (Strategy 3)
+    if doc_resp.status_code not in (200, 201) and endpoint_type == "printer":
         if debug:
             try:
                 err_details = _extract_graph_error(doc_resp)
@@ -397,7 +425,7 @@ def create_document_and_upload_session(
             except Exception:  # noqa: BLE001
                 pass
         
-        # Strategy 3: Try to use printer share endpoint
+        # Strategy 3: Try to use printer share endpoint as fallback
         try:
             if debug:
                 print(f"[debug] Strategy 3: Attempting via printer share endpoint", file=sys.stderr)
@@ -406,12 +434,12 @@ def create_document_and_upload_session(
             matching_shares = _discover_printer_shares(token, printer_id, debug=debug)
             
             if matching_shares:
-                share_id = matching_shares[0].get("id")
+                fallback_share_id = matching_shares[0].get("id")
                 if debug:
-                    print(f"[debug] using share ID: {share_id}", file=sys.stderr)
+                    print(f"[debug] using share ID: {fallback_share_id}", file=sys.stderr)
                 
                 # Try to create document via share endpoint
-                share_doc_url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs/{job_id}/documents"
+                share_doc_url = f"{GRAPH_BASE_URL}/print/shares/{fallback_share_id}/jobs/{job_id}/documents"
                 if debug:
                     print(f"[debug] POST {share_doc_url}", file=sys.stderr)
                 
@@ -430,6 +458,16 @@ def create_document_and_upload_session(
         except Exception as e:  # noqa: BLE001
             if debug:
                 print(f"[debug] Strategy 3 exception: {e}", file=sys.stderr)
+    elif doc_resp.status_code not in (200, 201):
+        # Already using share endpoint, so no fallback available
+        if debug:
+            try:
+                err_details = _extract_graph_error(doc_resp)
+                print(f"[debug] Strategy 2 failed: {_build_graph_error_message('Create document', doc_resp)}", file=sys.stderr)
+                if err_details.get("raw_response"):
+                    print(f"[debug] response body: {json.dumps(err_details['raw_response'], separators=(',', ':'), ensure_ascii=False)}", file=sys.stderr)
+            except Exception:  # noqa: BLE001
+                pass
     
     # Check if any strategy for document creation worked
     if doc_resp.status_code not in (200, 201):
@@ -476,7 +514,12 @@ def create_document_and_upload_session(
         print(f"[debug] document created: {document_id}", file=sys.stderr)
 
     # Now create upload session for the document
-    session_url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs/{job_id}/documents/{document_id}/createUploadSession"
+    # Use the same endpoint type (share or printer) as was used to create the job
+    if endpoint_type == "share" and share_id:
+        session_url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs/{job_id}/documents/{document_id}/createUploadSession"
+    else:
+        session_url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs/{job_id}/documents/{document_id}/createUploadSession"
+    
     if debug:
         try:
             print(f"[debug] POST {session_url} body={{}}", file=sys.stderr)
@@ -698,6 +741,16 @@ def main() -> int:
                     print(f"[debug] WARNING: Content type '{content_type_to_check}' may not be supported by printer", file=sys.stderr)
                     print(f"[debug] Supported types: {json.dumps(content_types, separators=(',', ':'), ensure_ascii=False)}", file=sys.stderr)
 
+        # Discover printer shares to determine best endpoint for job creation
+        matching_shares = _discover_printer_shares(token, args.printer_id, debug=args.debug)
+        preferred_share_id = None
+        if matching_shares:
+            preferred_share_id = matching_shares[0].get("id")
+            if args.debug:
+                print(f"[debug] Found printer share: {preferred_share_id}, will use share endpoint", file=sys.stderr)
+        elif args.debug:
+            print(f"[debug] No shares found, will use printer endpoint", file=sys.stderr)
+
         # Build job configuration from printer defaults to avoid 400 Missing configuration
         defaults = _get_printer_defaults(token, args.printer_id, debug=args.debug)
         job_configuration = _build_job_configuration_from_defaults(defaults)
@@ -707,11 +760,15 @@ def main() -> int:
             except Exception:  # noqa: BLE001
                 pass
 
-        job = create_print_job(token, args.printer_id, args.job_name, job_configuration=job_configuration or None, debug=args.debug)
+        job = create_print_job(token, args.printer_id, args.job_name, job_configuration=job_configuration or None, debug=args.debug, share_id=preferred_share_id)
         job_id = job.get("id")
         if not job_id:
             raise RuntimeError("Job ID missing in create job response")
         print(f"Created job {job_id}")
+
+        # Extract endpoint metadata from job to ensure consistent endpoint usage
+        endpoint_type = job.get("_endpoint_type", "printer")
+        used_share_id = job.get("_share_id")
 
         _, upload_url = create_document_and_upload_session(
             token,
@@ -720,6 +777,8 @@ def main() -> int:
             args.file_path,
             args.content_type,
             debug=args.debug,
+            endpoint_type=endpoint_type,
+            share_id=used_share_id,
         )
         print("Uploading document...")
         upload_file_to_upload_session(upload_url, args.file_path)
