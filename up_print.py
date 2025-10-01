@@ -245,7 +245,34 @@ def _noop() -> None:
     return None
 
 
-def create_print_job(token: str, printer_id: str, job_name: str, job_configuration: Optional[Dict[str, Any]] = None) -> Dict:
+def _discover_printer_shares(token: str, printer_id: str, debug: bool = False) -> List[Dict[str, Any]]:
+    """Discover all shares for a given printer.
+    
+    Returns a list of share objects that reference this printer.
+    Returns empty list if no shares found or on error.
+    """
+    try:
+        shares_url = f"{GRAPH_BASE_URL}/print/shares"
+        shares_resp = requests.get(shares_url, headers=graph_headers(token), timeout=30)
+        
+        if shares_resp.status_code != 200:
+            if debug:
+                print(f"[debug] shares discovery failed: {_build_graph_error_message('List shares', shares_resp)}", file=sys.stderr)
+            return []
+        
+        shares_data = shares_resp.json() or {}
+        shares = shares_data.get("value") or []
+        
+        # Filter shares manually to find ones matching this printer
+        matching_shares = [s for s in shares if (s.get("printer") or {}).get("id") == printer_id]
+        return matching_shares
+    except Exception as e:  # noqa: BLE001
+        if debug:
+            print(f"[debug] exception discovering shares: {e}", file=sys.stderr)
+        return []
+
+
+def create_print_job(token: str, printer_id: str, job_name: str, job_configuration: Optional[Dict[str, Any]] = None, debug: bool = False) -> Dict:
     url = f"{GRAPH_BASE_URL}/print/printers/{printer_id}/jobs"
     payload: Dict[str, Any] = {"displayName": job_name}
     if job_configuration:
@@ -290,26 +317,19 @@ def create_document_and_upload_session(
         
         # Also try to access via the shares endpoint as alternative
         try:
-            # Try to discover shares for this printer
-            shares_url = f"{GRAPH_BASE_URL}/print/shares?$filter=printer/id eq '{printer_id}'"
-            shares_resp = requests.get(shares_url, headers=graph_headers(token), timeout=30)
-            if shares_resp.status_code == 200:
-                shares_data = shares_resp.json() or {}
-                shares = shares_data.get("value") or []
-                if shares:
-                    share_id = shares[0].get("id")
-                    print(f"[debug] discovered printer share: {share_id}", file=sys.stderr)
-                    # Try to access job via share endpoint
-                    share_job_url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs/{job_id}?$select=id,createdDateTime,status"
-                    share_job_resp = requests.get(share_job_url, headers=graph_headers(token), timeout=30)
-                    if share_job_resp.status_code == 200:
-                        print(f"[debug] job accessible via share endpoint", file=sys.stderr)
-                    else:
-                        print(f"[debug] share job lookup failed: {_build_graph_error_message('Get share job', share_job_resp)}", file=sys.stderr)
+            matching_shares = _discover_printer_shares(token, printer_id, debug=debug)
+            if matching_shares:
+                share_id = matching_shares[0].get("id")
+                print(f"[debug] discovered printer share: {share_id}", file=sys.stderr)
+                # Try to access job via share endpoint
+                share_job_url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs/{job_id}?$select=id,createdDateTime,status"
+                share_job_resp = requests.get(share_job_url, headers=graph_headers(token), timeout=30)
+                if share_job_resp.status_code == 200:
+                    print(f"[debug] job accessible via share endpoint", file=sys.stderr)
                 else:
-                    print(f"[debug] no shares found for printer", file=sys.stderr)
+                    print(f"[debug] share job lookup failed: {_build_graph_error_message('Get share job', share_job_resp)}", file=sys.stderr)
             else:
-                print(f"[debug] shares discovery failed: {_build_graph_error_message('List shares', shares_resp)}", file=sys.stderr)
+                print(f"[debug] no shares found for printer", file=sys.stderr)
         except Exception:  # noqa: BLE001
             pass
 
@@ -382,39 +402,31 @@ def create_document_and_upload_session(
             if debug:
                 print(f"[debug] Strategy 3: Attempting via printer share endpoint", file=sys.stderr)
             
-            # First, discover the share ID for this printer
-            shares_url = f"{GRAPH_BASE_URL}/print/shares?$filter=printer/id eq '{printer_id}'"
-            shares_resp = requests.get(shares_url, headers=graph_headers(token), timeout=30)
+            # Discover the share ID for this printer
+            matching_shares = _discover_printer_shares(token, printer_id, debug=debug)
             
-            if shares_resp.status_code == 200:
-                shares_data = shares_resp.json() or {}
-                shares = shares_data.get("value") or []
+            if matching_shares:
+                share_id = matching_shares[0].get("id")
+                if debug:
+                    print(f"[debug] using share ID: {share_id}", file=sys.stderr)
                 
-                if shares:
-                    share_id = shares[0].get("id")
+                # Try to create document via share endpoint
+                share_doc_url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs/{job_id}/documents"
+                if debug:
+                    print(f"[debug] POST {share_doc_url}", file=sys.stderr)
+                
+                share_doc_resp = requests.post(share_doc_url, headers=graph_headers(token), json=doc_payload, timeout=60)
+                
+                if share_doc_resp.status_code in (200, 201):
                     if debug:
-                        print(f"[debug] using share ID: {share_id}", file=sys.stderr)
-                    
-                    # Try to create document via share endpoint
-                    share_doc_url = f"{GRAPH_BASE_URL}/print/shares/{share_id}/jobs/{job_id}/documents"
-                    if debug:
-                        print(f"[debug] POST {share_doc_url}", file=sys.stderr)
-                    
-                    share_doc_resp = requests.post(share_doc_url, headers=graph_headers(token), json=doc_payload, timeout=60)
-                    
-                    if share_doc_resp.status_code in (200, 201):
-                        if debug:
-                            print(f"[debug] Strategy 3 succeeded!", file=sys.stderr)
-                        doc_resp = share_doc_resp  # Use this response
-                    else:
-                        if debug:
-                            print(f"[debug] Strategy 3 failed: {_build_graph_error_message('Create document (share)', share_doc_resp)}", file=sys.stderr)
+                        print(f"[debug] Strategy 3 succeeded!", file=sys.stderr)
+                    doc_resp = share_doc_resp  # Use this response
                 else:
                     if debug:
-                        print(f"[debug] Strategy 3 skipped: no shares found", file=sys.stderr)
+                        print(f"[debug] Strategy 3 failed: {_build_graph_error_message('Create document (share)', share_doc_resp)}", file=sys.stderr)
             else:
                 if debug:
-                    print(f"[debug] Strategy 3 skipped: shares discovery failed", file=sys.stderr)
+                    print(f"[debug] Strategy 3 skipped: no shares found", file=sys.stderr)
         except Exception as e:  # noqa: BLE001
             if debug:
                 print(f"[debug] Strategy 3 exception: {e}", file=sys.stderr)
@@ -422,12 +434,38 @@ def create_document_and_upload_session(
     # Check if any strategy for document creation worked
     if doc_resp.status_code not in (200, 201):
         err_msg = _build_graph_error_message("Create document", doc_resp)
-        raise RuntimeError(f"{err_msg}\n\nAll strategies failed. This may indicate:\n"
-                         "1. Missing PrinterShare.ReadWrite.All permission\n"
-                         "2. Job was created but is not accessible for document upload\n"
-                         "3. Printer or connector configuration issue\n"
-                         "4. API version incompatibility\n\n"
-                         "Try running with --debug for detailed diagnostics.")
+        
+        # Extract error details for better diagnostics
+        err_details = _extract_graph_error(doc_resp)
+        error_code = err_details.get("error_code")
+        
+        # Provide more specific guidance based on the error
+        if error_code == "UnknownError" and doc_resp.status_code == 404:
+            guidance = (
+                "\n\nThe job was created but documents cannot be attached (404 UnknownError).\n"
+                "This typically indicates one of the following:\n\n"
+                "1. The printer is not properly shared or the share is not accessible\n"
+                "   → Check that PrinterShare.ReadWrite.All permission is granted and consented\n"
+                "   → Verify the printer has at least one active share in the Universal Print portal\n\n"
+                "2. The job endpoint may require access via the share API instead\n"
+                "   → Try creating the job via /print/shares/{shareId}/jobs instead\n\n"
+                "3. The Universal Print connector may be offline or misconfigured\n"
+                "   → Verify the connector is online in the Universal Print portal\n\n"
+                "4. There may be a timing issue where the job is not immediately available\n"
+                "   → This is a known issue with some printer configurations\n\n"
+                "Try running with --debug for detailed diagnostics."
+            )
+        else:
+            guidance = (
+                "\n\nAll strategies failed. This may indicate:\n"
+                "1. Missing PrinterShare.ReadWrite.All permission\n"
+                "2. Job was created but is not accessible for document upload\n"
+                "3. Printer or connector configuration issue\n"
+                "4. API version incompatibility\n\n"
+                "Try running with --debug for detailed diagnostics."
+            )
+        
+        raise RuntimeError(f"{err_msg}{guidance}")
     
     document = doc_resp.json() or {}
     document_id = document.get("id")
@@ -669,7 +707,7 @@ def main() -> int:
             except Exception:  # noqa: BLE001
                 pass
 
-        job = create_print_job(token, args.printer_id, args.job_name, job_configuration=job_configuration or None)
+        job = create_print_job(token, args.printer_id, args.job_name, job_configuration=job_configuration or None, debug=args.debug)
         job_id = job.get("id")
         if not job_id:
             raise RuntimeError("Job ID missing in create job response")
