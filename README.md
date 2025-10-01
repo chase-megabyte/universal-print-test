@@ -60,39 +60,60 @@ python up_print.py --poll
 
 #### Debugging 404 on createUploadSession / create document
 
-A common issue is receiving 404 errors when trying to create documents or upload sessions after successfully creating a print job. This can happen due to:
+A common issue is receiving 404 errors when trying to create documents or upload sessions after successfully creating a print job. The script has been **significantly improved** to handle this automatically.
 
-1. **Missing `PrinterShare.ReadWrite.All` permission**: Even though the job was created successfully with `PrintJob.ReadWrite.All`, some environments require `PrinterShare.ReadWrite.All` to add documents to jobs. Add this permission in your app registration and grant admin consent.
+**What's been improved:**
 
-2. **Unsupported document format**: The printer may not support the document format you're uploading (e.g., `application/pdf`). Use `--debug` to see the printer's supported content types. Some printers only support `application/oxps`. Consider converting your document to a supported format.
+1. **Share-first approach**: The script now discovers printer shares **before** creating the job and uses the share endpoint by default when available. This is the most reliable method.
 
-3. **Share-based access required**: In some Universal Print environments, document operations require accessing jobs through printer shares rather than direct printer access. The script now automatically:
-   - Discovers printer shares associated with your printer
-   - Attempts to create documents via the share endpoint if direct access fails
-   - This is especially common with delegated permissions (device code flow)
+2. **Enhanced share discovery**: Improved share discovery with retry logic and `$expand=printer` for better reliability.
 
-4. **API endpoint variations**: The script tries three fallback strategies:
-   - **Strategy 1**: `/print/printers/{printerId}/jobs/{jobId}/documents/createUploadSession` (modern single-call)
-   - **Strategy 2**: Create document at `/print/printers/{printerId}/jobs/{jobId}/documents`, then create upload session (legacy two-step)
-   - **Strategy 3 (NEW)**: Discover share via `/print/shares?$filter=printer/id eq '{printerId}'` and create document via `/print/shares/{shareId}/jobs/{jobId}/documents`
+3. **Multiple fallback strategies**: If one approach fails, the script automatically tries alternatives:
+   - **Strategy 1**: Create upload session directly (modern single-call API) via share or printer endpoint
+   - **Strategy 2**: Create document first, then upload session (legacy two-step) via share or printer endpoint
+   - **Strategy 3**: Discover shares as fallback and retry via share endpoint if not already used
 
-5. **Permission scope mismatch**: If using delegated permissions (device code flow with `--auth device`), ensure your account has access to the printer. Application permissions require: `Printer.Read.All`, `PrintJob.ReadWrite.All`, `PrintJob.Manage.All`, and ideally `PrinterShare.ReadWrite.All`.
+4. **Consistent endpoint usage**: Once a share is used to create the job, it's used consistently for all operations (create document, upload session, start job).
 
-**Recommended solution**: 
-- Add `PrinterShare.ReadWrite.All` to your app registration's application permissions and grant admin consent
-- Ensure the printer has at least one share configured in the Azure Portal
-- Run with `--debug` to see which strategy succeeds
+**Common causes of 404 errors:**
 
-With `--debug`, the script now:
-- Attempts share discovery and reports available share IDs
-- Shows strategy-by-strategy attempt and result (Strategy 1, 2, 3)
-- Prints full URLs for all API calls
-- Shows the complete error response body including the Graph error details
-- Shows printer capabilities and supported content types
-- Includes `request-id`/`client-request-id` for all failures to speed up support cases
-- Reports which endpoint finally succeeded
+1. **Missing `PrinterShare.ReadWrite.All` permission**: Even though jobs can be created with `PrintJob.ReadWrite.All`, many environments require `PrinterShare.ReadWrite.All` to attach documents. **Solution**: Add this permission in your app registration and grant admin consent.
 
-**See `DIAGNOSTIC_REPORT.md` for detailed troubleshooting of 404 errors.**
+2. **Printer not shared**: The printer must have at least one active share in the Universal Print portal. **Solution**: Create a share in Azure Portal → Universal Print → Printers → [Your Printer] → Sharing.
+
+3. **Universal Print connector offline**: The connector on the Windows machine must be online. **Solution**: Verify connector status in the portal and check Windows Event Logs.
+
+4. **Timing issues**: Some configurations have a delay before jobs accept documents. **Solution**: The script now includes retry logic; if issues persist, wait 30-60 seconds between job creation attempts.
+
+**Recommended setup:**
+```
+Required permissions:
+- Printer.Read.All (required)
+- PrintJob.ReadWrite.All (required)
+- PrintJob.Manage.All (required)
+- PrinterShare.ReadWrite.All (strongly recommended - enables share-based access)
+```
+
+**Debugging with `--debug` flag:**
+
+With `--debug`, the script provides comprehensive diagnostics:
+- Share discovery results (total shares found, matching shares with IDs)
+- Which endpoint is being used (share vs printer) for each operation
+- Strategy-by-strategy attempts with full URLs
+- Complete error response bodies with request IDs
+- Printer capabilities and supported content types
+- Success/failure indication for each strategy
+
+**Example debug output:**
+```
+[debug] total shares found: 3
+[debug] found matching share: abc-123 (My Printer Share)
+[debug] will use share endpoint for job creation: abc-123
+[debug] creating job via share: abc-123
+Created job 22
+[debug] Strategy 1 (via share): POST .../shares/abc-123/jobs/22/documents/createUploadSession
+[debug] Strategy 1 succeeded
+```
 
 ### What the script does
 
