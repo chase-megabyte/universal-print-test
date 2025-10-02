@@ -722,7 +722,9 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(description="Create and start a Universal Print job via Microsoft Graph")
     parser.add_argument("--printer-id", default=os.getenv("PRINTER_ID"), help="Printer ID in Universal Print")
+    parser.add_argument("--file", default=os.getenv("FILE_PATH"), help="Path to the file to print")
     parser.add_argument("--job-name", default="UP Job", help="Display name for the print job")
+    parser.add_argument("--content-type", default=os.getenv("CONTENT_TYPE"), help="MIME type of the document (e.g., application/pdf)")
     parser.add_argument("--poll", action="store_true", help="Poll job status until completion")
     parser.add_argument("--debug", action="store_true", help="Print token claims and verbose diagnostics")
     parser.add_argument("--auth", choices=["app", "device"], default=os.getenv("AUTH", "app"), help="Authentication mode: app (client credentials) or device (device code delegated)")
@@ -737,12 +739,18 @@ def main() -> int:
         ("--tenant-id", args.tenant_id),
         ("--client-id", args.client_id),
         ("--printer-id", args.printer_id),
+        ("--file", args.file),
     ]
     if args.auth == "app":
         required_base.append(("--client-secret", args.client_secret))
     missing = [name for name, val in required_base if not val]
     if missing:
         print(f"Missing required arguments: {' '.join(missing)}", file=sys.stderr)
+        return 2
+    
+    # Validate file exists
+    if not os.path.exists(args.file):
+        print(f"Error: File not found: {args.file}", file=sys.stderr)
         return 2
 
     try:
@@ -801,6 +809,26 @@ def main() -> int:
         if not job_id:
             raise RuntimeError("Job ID missing in create job response")
         print(f"Created job {job_id}")
+
+        # Upload document to the job
+        print("Uploading document...")
+        document_id, upload_url = create_document_and_upload_session(
+            token,
+            args.printer_id,
+            job_id,
+            args.file,
+            args.content_type,
+            debug=args.debug,
+            share_id=job_share_id
+        )
+        
+        upload_file_to_upload_session(upload_url, args.file)
+        print("Upload complete.")
+
+        # Start the job
+        print("Starting job...")
+        start_print_job(token, args.printer_id, job_id, share_id=job_share_id, debug=args.debug)
+        print("Job started.")
 
         if args.poll:
             poll_until_completed(token, args.printer_id, job_id)
