@@ -722,11 +722,8 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(description="Create and start a Universal Print job via Microsoft Graph")
     parser.add_argument("--printer-id", default=os.getenv("PRINTER_ID"), help="Printer ID in Universal Print")
-    # Share functionality removed; use printer-id endpoints only
-    parser.add_argument("--file", dest="file_path", default=os.getenv("FILE_PATH"), help="Path to file to print (PDF, XPS, etc.)")
     parser.add_argument("--job-name", default="UP Job", help="Display name for the print job")
     parser.add_argument("--poll", action="store_true", help="Poll job status until completion")
-    parser.add_argument("--content-type", dest="content_type", default=None, help="Override document contentType (e.g., application/pdf)")
     parser.add_argument("--debug", action="store_true", help="Print token claims and verbose diagnostics")
     parser.add_argument("--auth", choices=["app", "device"], default=os.getenv("AUTH", "app"), help="Authentication mode: app (client credentials) or device (device code delegated)")
     parser.add_argument("--scopes", nargs="*", default=os.getenv("SCOPES", "Printer.Read.All PrintJob.ReadWrite.All PrintJob.Manage.All offline_access").split(), help="Delegated scopes for device auth (space-separated)")
@@ -740,16 +737,12 @@ def main() -> int:
         ("--tenant-id", args.tenant_id),
         ("--client-id", args.client_id),
         ("--printer-id", args.printer_id),
-        ("--file", args.file_path),
     ]
     if args.auth == "app":
         required_base.append(("--client-secret", args.client_secret))
     missing = [name for name, val in required_base if not val]
     if missing:
         print(f"Missing required arguments: {' '.join(missing)}", file=sys.stderr)
-        return 2
-    if not os.path.exists(args.file_path):
-        print(f"File not found: {args.file_path}", file=sys.stderr)
         return 2
 
     try:
@@ -775,16 +768,6 @@ def main() -> int:
         if args.debug:
             meta = preflight.json()
             print(f"[debug] printer ok: {meta.get('id')} {meta.get('displayName')}", file=sys.stderr)
-
-        # Check printer capabilities and supported content types
-        if args.debug:
-            capabilities = _get_printer_capabilities(token, args.printer_id, debug=args.debug)
-            content_types = capabilities.get("contentTypes") or []
-            if content_types:
-                content_type_to_check, _ = detect_content_type(args.file_path, args.content_type, debug=False)
-                if content_type_to_check not in content_types:
-                    print(f"[debug] WARNING: Content type '{content_type_to_check}' may not be supported by printer", file=sys.stderr)
-                    print(f"[debug] Supported types: {json.dumps(content_types, separators=(',', ':'), ensure_ascii=False)}", file=sys.stderr)
 
         # Build job configuration from printer defaults to avoid 400 Missing configuration
         defaults = _get_printer_defaults(token, args.printer_id, debug=args.debug)
@@ -818,23 +801,6 @@ def main() -> int:
         if not job_id:
             raise RuntimeError("Job ID missing in create job response")
         print(f"Created job {job_id}")
-
-        _, upload_url = create_document_and_upload_session(
-            token,
-            args.printer_id,
-            job_id,
-            args.file_path,
-            args.content_type,
-            debug=args.debug,
-            share_id=job_share_id,
-        )
-        print("Uploading document...")
-        upload_file_to_upload_session(upload_url, args.file_path)
-        print("Upload complete.")
-
-        print("Starting job...")
-        start_print_job(token, args.printer_id, job_id, share_id=job_share_id, debug=args.debug)
-        print("Job started.")
 
         if args.poll:
             poll_until_completed(token, args.printer_id, job_id)
